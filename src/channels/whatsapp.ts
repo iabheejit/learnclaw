@@ -69,6 +69,7 @@ class WhatsAppChannel implements Channel {
 
   private reconnectDelay = 5 * ONE_SECOND;
   private readonly MAX_RECONNECT_DELAY = 5 * 60 * ONE_SECOND; // cap at 5 min
+  private readonly QR_RETRY_DELAY = 30 * ONE_SECOND; // wait before showing a fresh QR
   private connGen = 0; // monotonically increasing generation to drop stale events
 
   async connect(): Promise<void> {
@@ -186,7 +187,10 @@ class WhatsAppChannel implements Channel {
       logger.debug({ lidJid: jid, phoneJid }, 'Translated LID to phone JID');
       return phoneJid;
     }
-    logger.warn({ lidJid: jid }, 'Unresolved @lid JID — contact not yet in map');
+    logger.warn(
+      { lidJid: jid },
+      'Unresolved @lid JID — contact not yet in map',
+    );
     return jid;
   }
 
@@ -224,14 +228,23 @@ class WhatsAppChannel implements Channel {
     }
   }
 
-  private async connectInternal(): Promise<void> {
-    if (!fs.existsSync(AUTH_DIR)) {
-      logger.warn(
-        { authDir: AUTH_DIR },
-        'WhatsApp auth directory missing — channel skipped. Run whatsapp-auth setup.',
-      );
-      return;
+  /** Wipe stale auth credentials so Baileys requests a fresh QR on next connect. */
+  private wipeAuthCredentials(): void {
+    try {
+      if (fs.existsSync(AUTH_DIR)) {
+        for (const f of fs.readdirSync(AUTH_DIR)) {
+          fs.rmSync(path.join(AUTH_DIR, f), { force: true });
+        }
+        logger.info('Wiped stale WhatsApp auth credentials');
+      }
+    } catch (err) {
+      logger.error({ err }, 'Failed to wipe auth credentials');
     }
+  }
+
+  private async connectInternal(): Promise<void> {
+    // Create auth dir if missing — Baileys will request a fresh QR
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
 
     const myGen = ++this.connGen; // capture generation at connection start
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
@@ -240,7 +253,10 @@ class WhatsAppChannel implements Channel {
     try {
       const fetched = await fetchLatestBaileysVersion();
       version = fetched.version;
-      logger.info({ version: version.join('.') }, 'Fetched latest WA Web version');
+      logger.info(
+        { version: version.join('.') },
+        'Fetched latest WA Web version',
+      );
     } catch {
       logger.warn('Failed to fetch latest WA version, using Baileys default');
     }
@@ -262,8 +278,8 @@ class WhatsAppChannel implements Channel {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        logger.error(
-          'WhatsApp QR code required — re-run whatsapp-auth setup to re-authenticate.',
+        logger.warn(
+          'WhatsApp QR code available — scan via dashboard or Linked Devices.',
         );
         waState.status = 'needs_qr';
         waState.qrString = qr;
@@ -279,51 +295,55 @@ class WhatsAppChannel implements Channel {
             | { output?: { statusCode?: number } }
             | undefined
         )?.output?.statusCode;
-        const shouldReconnect = reason !== DisconnectReason.loggedOut;
         logger.info(
           {
             reason,
-            shouldReconnect,
             queuedMessages: this.outgoingQueue.length,
           },
           'WA connection closed',
         );
 
-        if (shouldReconnect && !this.shuttingDown) {
-          waState.status = 'connecting';
-          waState.qrString = null;
-          waState.qrDataUrl = null;
-          waState.qrExpiresAt = null;
-          logger.info(
-            { reconnectIn: this.reconnectDelay },
-            'Reconnecting to WhatsApp...',
-          );
-          setTimeout(() => {
-            if (this.sock) {
-              try {
-                this.sock.end(undefined);
-              } catch {
-                /* best-effort */
-              }
-              this.sock = null;
-            }
-            this.connectInternal().catch((err) =>
-              logger.error({ err }, 'Failed to reconnect to WhatsApp'),
+        if (!this.shuttingDown) {
+          if (this.sock) {
+            try { this.sock.end(undefined); } catch { /* best-effort */ }
+            this.sock = null;
+          }
+
+          if (reason === DisconnectReason.loggedOut) {
+            // Session invalidated (stale, server eviction, manual unlink, etc.).
+            // Wipe creds so next connectInternal() gets a fresh QR for re-auth.
+            logger.warn('WhatsApp session invalidated (401) — wiping stale credentials and requesting fresh QR');
+            this.wipeAuthCredentials();
+            waState.status = 'needs_qr';
+            waState.qrString = null;
+            waState.qrDataUrl = null;
+            waState.qrExpiresAt = null;
+            // Reconnect after short delay to get a fresh QR
+            setTimeout(() => {
+              this.connectInternal().catch((err) =>
+                logger.error({ err }, 'Failed to reconnect after 401'),
+              );
+            }, this.QR_RETRY_DELAY);
+          } else {
+            // Transient disconnect — exponential backoff reconnect
+            waState.status = 'connecting';
+            waState.qrString = null;
+            waState.qrDataUrl = null;
+            waState.qrExpiresAt = null;
+            logger.info(
+              { reconnectIn: this.reconnectDelay },
+              'Reconnecting to WhatsApp...',
             );
-          }, this.reconnectDelay);
-          // Exponential backoff, capped at MAX_RECONNECT_DELAY
-          this.reconnectDelay = Math.min(
-            this.reconnectDelay * 2,
-            this.MAX_RECONNECT_DELAY,
-          );
-        } else if (!this.shuttingDown) {
-          waState.status = 'disconnected';
-          waState.qrString = null;
-          waState.qrDataUrl = null;
-          waState.qrExpiresAt = null;
-          logger.error(
-            'WhatsApp session logged out — run whatsapp-auth setup to re-authenticate.',
-          );
+            setTimeout(() => {
+              this.connectInternal().catch((err) =>
+                logger.error({ err }, 'Failed to reconnect to WhatsApp'),
+              );
+            }, this.reconnectDelay);
+            this.reconnectDelay = Math.min(
+              this.reconnectDelay * 2,
+              this.MAX_RECONNECT_DELAY,
+            );
+          }
         }
       } else if (connection === 'open') {
         this.connected = true;
@@ -383,14 +403,17 @@ class WhatsAppChannel implements Channel {
     sock.ev.on('creds.update', saveCreds);
 
     // Build LID→phone map from contact sync so DMs using @lid JIDs can be resolved
-    const addContactToLidMap = (contacts: Array<{ id: string; lid?: string; jid?: string }>) => {
+    const addContactToLidMap = (
+      contacts: Array<{ id: string; lid?: string; jid?: string }>,
+    ) => {
       for (const contact of contacts) {
         const phoneJid = contact.jid
           ? jidNormalizedUser(contact.jid)
           : !isLidUser(contact.id)
             ? jidNormalizedUser(contact.id)
             : null;
-        const lidRaw = contact.lid ?? (isLidUser(contact.id) ? contact.id : null);
+        const lidRaw =
+          contact.lid ?? (isLidUser(contact.id) ? contact.id : null);
         const lid = lidRaw?.split('@')[0].split(':')[0];
         if (lid && phoneJid && !this.lidToPhoneMap[lid]) {
           this.lidToPhoneMap[lid] = phoneJid;
@@ -406,7 +429,9 @@ class WhatsAppChannel implements Channel {
 
     sock.ev.on('contacts.update', (updates) => {
       if (myGen !== this.connGen) return;
-      addContactToLidMap(updates as Array<{ id: string; lid?: string; jid?: string }>);
+      addContactToLidMap(
+        updates as Array<{ id: string; lid?: string; jid?: string }>,
+      );
     });
 
     // chats.phoneNumberShare fires when WA explicitly shares a LID↔phone binding
@@ -416,7 +441,10 @@ class WhatsAppChannel implements Channel {
       const phoneJid = jidNormalizedUser(jid);
       if (lidKey && phoneJid) {
         this.lidToPhoneMap[lidKey] = phoneJid;
-        logger.info({ lid: lidKey, phoneJid }, 'LID→phone bound via phoneNumberShare');
+        logger.info(
+          { lid: lidKey, phoneJid },
+          'LID→phone bound via phoneNumberShare',
+        );
       }
     });
 
@@ -477,13 +505,9 @@ class WhatsAppChannel implements Channel {
 // Self-registration: returning null tells the registry to skip this channel
 // when credentials are absent (handled inside WhatsAppChannel.connect()).
 registerChannel('whatsapp', (opts: ChannelOpts) => {
-  if (!fs.existsSync(AUTH_DIR)) {
-    return null;
-  }
-  // Check that there are actual credential files (not just an empty dir)
-  const files = fs.readdirSync(AUTH_DIR);
-  if (files.length === 0) {
-    return null;
-  }
+  // Always create the channel — even without pre-existing auth credentials.
+  // If no creds exist, connectInternal() will request a fresh QR code that
+  // can be scanned via the dashboard. This prevents boot crashes when WA
+  // sessions go stale or auth files get wiped.
   return new WhatsAppChannel(opts);
 });
