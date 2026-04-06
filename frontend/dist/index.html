@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Batcave — Command Center</title>
+  <meta name="description" content="NanoClaw control panel" />
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0d0f14;
+      --surface: #161b24;
+      --surface2: #1e2533;
+      --border: #2a3347;
+      --accent: #f5a623;
+      --accent2: #4fc3f7;
+      --green: #4caf50;
+      --red: #f44336;
+      --yellow: #ffc107;
+      --text: #e8eaf0;
+      --muted: #8892a4;
+      --font: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+    a { color: var(--accent2); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header h1 { font-size: 15px; color: var(--accent); letter-spacing: 1px; text-transform: uppercase; }
+    .wa-badge {
+      display: flex; align-items: center; gap: 6px;
+      background: var(--surface2); border: 1px solid var(--border);
+      padding: 3px 10px; border-radius: 4px; font-size: 11px;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+    .dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .dot.connecting { background: var(--yellow); animation: pulse 1s infinite; }
+    .dot.needs_qr { background: var(--yellow); animation: pulse 0.5s infinite; }
+    .dot.disconnected { background: var(--red); }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    .uptime { margin-left: auto; font-size: 11px; color: var(--muted); }
+    .refresh-btn {
+      background: none; border: 1px solid var(--border); color: var(--muted);
+      padding: 3px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; font-family: var(--font);
+    }
+    .refresh-btn:hover { border-color: var(--accent2); color: var(--accent2); }
+    .main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 20px; }
+    @media (max-width: 900px) { .main { grid-template-columns: 1fr; } }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+    .card.full-width { grid-column: 1 / -1; }
+    .card-header {
+      background: var(--surface2); border-bottom: 1px solid var(--border);
+      padding: 10px 16px; display: flex; align-items: center; gap: 8px;
+    }
+    .card-header h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--accent2); }
+    .badge { background: var(--border); color: var(--muted); border-radius: 10px; padding: 1px 7px; font-size: 11px; }
+    .ml { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+    .card-body { padding: 12px 16px; }
+    .stat-row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .stat { background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 8px 14px; }
+    .stat .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat .value { font-size: 20px; color: var(--text); }
+    .stat .value.green { color: var(--green); }
+    .stat .value.yellow { color: var(--yellow); }
+    #qr-panel { display: none; text-align: center; padding: 20px; }
+    #qr-panel.visible { display: block; }
+    #qr-canvas { display: inline-block; background: white; padding: 12px; border-radius: 4px; margin-top: 12px; }
+    #qr-panel .qr-msg { color: var(--yellow); margin-top: 10px; font-size: 12px; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+         padding: 4px 8px; text-align: left; border-bottom: 1px solid var(--border); }
+    td { padding: 6px 8px; border-bottom: 1px solid #1c2230; vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--surface2); }
+    .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: bold; }
+    .pill.green { background: #1b3a1b; color: var(--green); border: 1px solid #2a5a2a; }
+    .pill.yellow { background: #3a331b; color: var(--yellow); border: 1px solid #5a4a2a; }
+    .pill.red { background: #3a1b1b; color: var(--red); border: 1px solid #5a2a2a; }
+    .pill.blue { background: #1b2d3a; color: var(--accent2); border: 1px solid #2a4a5a; }
+    .pill.gray { background: var(--border); color: var(--muted); }
+    .btn {
+      display: inline-block; padding: 4px 10px; border-radius: 4px;
+      cursor: pointer; font-size: 11px; font-family: var(--font);
+      border: 1px solid var(--border); background: var(--surface2); color: var(--text);
+    }
+    .btn:hover { border-color: var(--accent2); color: var(--accent2); }
+    .btn.danger:hover { border-color: var(--red); color: var(--red); }
+    .btn.primary { background: #1b3040; border-color: var(--accent2); color: var(--accent2); }
+    .btn.primary:hover { background: #1f3e52; }
+    .modal-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+      z-index: 200; align-items: center; justify-content: center;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      padding: 20px; min-width: 400px; max-width: 560px; width: 90%;
+      max-height: 90vh; overflow-y: auto;
+    }
+    .modal h3 { color: var(--accent2); margin-bottom: 14px; font-size: 13px; }
+    label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 3px; margin-top: 10px; }
+    input, select, textarea {
+      width: 100%; background: var(--surface2); border: 1px solid var(--border);
+      color: var(--text); font-family: var(--font); font-size: 12px;
+      padding: 6px 8px; border-radius: 4px; outline: none;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent2); }
+    textarea { resize: vertical; min-height: 70px; }
+    .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+    .integration-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px,1fr)); gap: 10px; }
+    .integration-tile {
+      background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+      padding: 12px; display: flex; flex-direction: column; gap: 8px;
+    }
+    .integration-tile.active { border-color: #2a5a2a; }
+    .integration-tile .title { font-size: 12px; color: var(--text); }
+    .integration-tile .sint { font-size: 10px; color: var(--muted); }
+    .integration-tile.active .sint { color: var(--green); }
+    .integration-tile .tile-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
+    #toast {
+      position: fixed; bottom: 20px; right: 20px; z-index: 999;
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 6px; padding: 10px 16px; font-size: 12px;
+      opacity: 0; transition: opacity 0.3s; pointer-events: none;
+    }
+    #toast.show { opacity: 1; }
+    #toast.ok { border-color: var(--green); color: var(--green); }
+    #toast.err { border-color: var(--red); color: var(--red); }
+    .empty { color: var(--muted); font-size: 12px; padding: 20px; text-align: center; }
+    .truncate { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; }
+    code { font-family: var(--font); font-size: 11px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🦇 Batcave</h1>
+  <div class="wa-badge">
+    <span class="dot connecting" id="wa-dot"></span>
+    <span id="wa-label">connecting</span>
+  </div>
+  <span id="uptime-display" class="uptime"></span>
+  <button class="refresh-btn" onclick="refreshAll()">↺ Refresh</button>
+</header>
+
+<div class="main">
+  <!-- Status -->
+  <div class="card">
+    <div class="card-header"><h2>System Status</h2></div>
+    <div class="card-body">
+      <div class="stat-row">
+        <div class="stat"><div class="label">Groups</div><div class="value" id="stat-groups">—</div></div>
+        <div class="stat"><div class="label">Active</div><div class="value green" id="stat-active">—</div></div>
+        <div class="stat"><div class="label">Listen-only</div><div class="value yellow" id="stat-listen">—</div></div>
+        <div class="stat"><div class="label">Tasks</div><div class="value" id="stat-tasks">—</div></div>
+      </div>
+      <div id="qr-panel">
+        <p class="qr-msg">⚠️ WhatsApp needs re-authentication — scan QR with your phone</p>
+        <div id="qr-canvas"></div>
+        <p class="qr-msg" id="qr-expiry"></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Groups -->
+  <div class="card">
+    <div class="card-header">
+      <h2>Groups</h2>
+      <span class="badge" id="groups-count">0</span>
+    </div>
+    <div class="card-body">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Name</th><th>Folder</th><th>Mode</th><th>Trigger</th><th></th></tr></thead>
+          <tbody id="groups-tbody"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tasks -->
+  <div class="card full-width">
+    <div class="card-header">
+      <h2>Scheduled Tasks</h2>
+      <span class="badge" id="tasks-count">0</span>
+      <div class="ml"><button class="btn primary" onclick="openNewTaskModal()">+ New Task</button></div>
+    </div>
+    <div class="card-body">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Group</th><th>Schedule</th><th>Prompt / Script</th><th>Next Run</th><th>Last Run</th><th>Status</th><th></th></tr></thead>
+          <tbody id="tasks-tbody"><tr><td colspan="7" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Brain -->
+  <div class="card full-width">
+    <div class="card-header">
+      <h2>Central Brain</h2>
+      <span class="badge" id="brain-count">0</span>
+      <div class="ml">
+        <select id="brain-filter-type" onchange="loadBrain()" style="width:auto;padding:3px 6px;font-size:11px;">
+          <option value="">All Types</option>
+          <option value="decision">Decisions</option>
+          <option value="action_item">Action Items</option>
+          <option value="insight">Insights</option>
+          <option value="follow_up">Follow-ups</option>
+        </select>
+        <select id="brain-filter-status" onchange="loadBrain()" style="width:auto;padding:3px 6px;font-size:11px;">
+          <option value="">All Status</option>
+          <option value="open">Open</option>
+          <option value="done">Done</option>
+          <option value="cancelled">Cancelled</option>
+        </select>
+      </div>
+    </div>
+    <div class="card-body">
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Type</th><th>Group</th><th>Content</th><th>Status</th><th>Created</th></tr></thead>
+          <tbody id="brain-tbody"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Integrations -->
+  <div class="card full-width">
+    <div class="card-header"><h2>Integrations</h2></div>
+    <div class="card-body">
+      <div class="integration-grid" id="integration-grid"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- Task Modal -->
+<div class="modal-backdrop" id="task-modal">
+  <div class="modal">
+    <h3 id="task-modal-title">New Scheduled Task</h3>
+    <input type="hidden" id="task-edit-id" />
+    <label>Group Folder</label>
+    <input type="text" id="task-group" placeholder="main" />
+    <label>Chat JID</label>
+    <input type="text" id="task-jid" placeholder="120363XXXXXXXXXX@g.us" />
+    <label>Schedule Type</label>
+    <select id="task-stype">
+      <option value="cron">cron</option>
+      <option value="interval">interval (ms)</option>
+      <option value="once">once</option>
+    </select>
+    <label>Schedule Value</label>
+    <input type="text" id="task-svalue" placeholder="0 8 * * * (cron) or 3600000 (ms)" />
+    <label>Context Mode</label>
+    <select id="task-ctx">
+      <option value="isolated">isolated</option>
+      <option value="group">group</option>
+    </select>
+    <label>Prompt</label>
+    <textarea id="task-prompt" placeholder="Send the daily briefing to the group"></textarea>
+    <label>Script (optional — overrides prompt)</label>
+    <textarea id="task-script" placeholder="# shell script…"></textarea>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeTaskModal()">Cancel</button>
+      <button class="btn primary" onclick="saveTask()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Credential Upload Modal -->
+<div class="modal-backdrop" id="upload-modal">
+  <div class="modal">
+    <h3 id="upload-modal-title">Upload Credentials</h3>
+    <input type="hidden" id="upload-type" />
+    <label>Paste JSON credential file contents:</label>
+    <textarea id="upload-json" rows="10" placeholder='{"type":"service_account",...}'></textarea>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeUploadModal()">Cancel</button>
+      <button class="btn primary" onclick="submitUpload()">Upload &amp; Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+var REFRESH_MS = 30000;
+var _refreshTimer = null;
+var _qrTimer = null;
+var API_TOKEN = (typeof window.__API_TOKEN !== 'undefined') ? window.__API_TOKEN : '';
+
+function toast(msg, type) {
+  var el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + (type || 'ok');
+  clearTimeout(el._t);
+  el._t = setTimeout(function(){ el.className = ''; }, 3500);
+}
+
+function fmt(iso) {
+  if (!iso) return '—';
+  var d = new Date(iso);
+  return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short'}) + ' ' + d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
+}
+
+function fmtUptime(sec) {
+  var h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60);
+  return h + 'h ' + m + 'm';
+}
+
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function apiFetch(method, path, body) {
+  var opts = { method: method, headers: {} };
+  if (API_TOKEN) opts.headers['X-Auth-Token'] = API_TOKEN;
+  if (body !== undefined) {
+    opts.body = JSON.stringify(body);
+    opts.headers['Content-Type'] = 'application/json';
+  }
+  var r = await fetch(path, opts);
+  if (!r.ok) throw new Error(method + ' ' + path + ' → ' + r.status);
+  return r.json();
+}
+
+// ---- Status ----
+async function loadStatus() {
+  try {
+    var s = await apiFetch('GET', '/api/status');
+    var dot = document.getElementById('wa-dot');
+    dot.className = 'dot ' + s.whatsapp;
+    document.getElementById('wa-label').textContent = s.whatsapp;
+    document.getElementById('uptime-display').textContent = 'uptime ' + fmtUptime(s.uptime);
+    document.getElementById('stat-groups').textContent = s.groups.total;
+    document.getElementById('stat-active').textContent = s.groups.active;
+    document.getElementById('stat-listen').textContent = s.groups.listenOnly;
+    if (s.whatsapp === 'needs_qr') { loadQR(); }
+    else { document.getElementById('qr-panel').classList.remove('visible'); }
+  } catch(e) {}
+}
+
+async function loadQR() {
+  try {
+    var q = await apiFetch('GET', '/api/auth/qr');
+    var panel = document.getElementById('qr-panel');
+    if (q.status !== 'needs_qr' || (!q.qrString && !q.qrDataUrl)) {
+      panel.classList.remove('visible');
+      return;
+    }
+    panel.classList.add('visible');
+    var container = document.getElementById('qr-canvas');
+    container.innerHTML = '';
+    if (q.qrString && typeof QRCode !== 'undefined') {
+      new QRCode(container, { text: q.qrString, width: 200, height: 200,
+        colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.M });
+    } else if (q.qrDataUrl) {
+      var img = document.createElement('img');
+      img.src = q.qrDataUrl; img.width = 200; img.height = 200;
+      container.appendChild(img);
+    }
+    if (q.qrExpiresAt) {
+      var secs = Math.max(0, Math.floor((q.qrExpiresAt - Date.now()) / 1000));
+      document.getElementById('qr-expiry').textContent = 'Expires in ~' + secs + 's — scan with WhatsApp';
+    }
+    clearTimeout(_qrTimer);
+    _qrTimer = setTimeout(loadQR, 20000);
+  } catch(e) {}
+}
+
+// ---- Groups ----
+async function loadGroups() {
+  try {
+    var groups = await apiFetch('GET', '/api/groups');
+    var entries = Object.entries(groups);
+    document.getElementById('groups-count').textContent = entries.length;
+    var tbody = document.getElementById('groups-tbody');
+    if (!entries.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No groups registered</td></tr>'; return; }
+    tbody.innerHTML = entries.map(function(pair) {
+      var jid = pair[0], g = pair[1];
+      var modePill = g.isMain ? '<span class="pill blue">main</span>'
+        : g.listenOnly ? '<span class="pill yellow">listen</span>'
+        : '<span class="pill green">active</span>';
+      return '<tr>'
+        + '<td><span class="truncate" title="'+esc(g.name)+'">'+esc(g.name)+'</span></td>'
+        + '<td><code>'+esc(g.folder)+'</code></td>'
+        + '<td>'+modePill+'</td>'
+        + '<td><code class="truncate" style="max-width:100px" title="'+esc(g.trigger)+'">'+esc(g.trigger)+'</code></td>'
+        + '<td><button class="btn danger" onclick="deleteGroup(\''+esc(jid)+'\',\''+esc(g.name)+'\')">Remove</button></td>'
+        + '</tr>';
+    }).join('');
+  } catch(e) {}
+}
+
+async function deleteGroup(jid, name) {
+  if (!confirm('Remove group "' + name + '"?\n(' + jid + ')')) return;
+  try {
+    await apiFetch('DELETE', '/api/groups/' + encodeURIComponent(jid));
+    toast('Group removed');
+    loadGroups(); loadStatus();
+  } catch(e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+// ---- Tasks ----
+async function loadTasks() {
+  try {
+    var tasks = await apiFetch('GET', '/api/tasks');
+    document.getElementById('tasks-count').textContent = tasks.length;
+    document.getElementById('stat-tasks').textContent = tasks.length;
+    var tbody = document.getElementById('tasks-tbody');
+    if (!tasks.length) { tbody.innerHTML = '<tr><td colspan="7" class="empty">No tasks configured</td></tr>'; return; }
+    var statusColors = { active:'green', paused:'yellow', completed:'gray' };
+    tbody.innerHTML = tasks.map(function(t) {
+      var sc = statusColors[t.status] || 'gray';
+      var prompt = (t.prompt || t.script || '—').slice(0,60);
+      var actions = '<button class="btn" onclick="editTask('+esc(JSON.stringify(t))+')">Edit</button> ';
+      if (t.status === 'active') actions += '<button class="btn" onclick="patchTask(\''+t.id+'\',\'paused\')">Pause</button> ';
+      if (t.status === 'paused') actions += '<button class="btn" onclick="patchTask(\''+t.id+'\',\'active\')">Resume</button> ';
+      actions += '<button class="btn danger" onclick="delTask(\''+t.id+'\')">Del</button>';
+      return '<tr>'
+        + '<td><code>'+esc(t.group_folder)+'</code></td>'
+        + '<td><code>'+esc(t.schedule_type)+': '+esc(t.schedule_value)+'</code></td>'
+        + '<td><span class="truncate" title="'+esc(t.prompt||t.script||'')+'">'+esc(prompt)+'</span></td>'
+        + '<td>'+fmt(t.next_run)+'</td>'
+        + '<td>'+fmt(t.last_run)+'</td>'
+        + '<td><span class="pill '+sc+'">'+t.status+'</span></td>'
+        + '<td style="white-space:nowrap">'+actions+'</td>'
+        + '</tr>';
+    }).join('');
+  } catch(e) {}
+}
+
+function openNewTaskModal() {
+  document.getElementById('task-modal-title').textContent = 'New Scheduled Task';
+  document.getElementById('task-edit-id').value = '';
+  document.getElementById('task-group').value = '';
+  document.getElementById('task-jid').value = '';
+  document.getElementById('task-stype').value = 'cron';
+  document.getElementById('task-svalue').value = '';
+  document.getElementById('task-ctx').value = 'isolated';
+  document.getElementById('task-prompt').value = '';
+  document.getElementById('task-script').value = '';
+  document.getElementById('task-modal').classList.add('open');
+}
+
+function editTask(t) {
+  if (typeof t === 'string') t = JSON.parse(t);
+  document.getElementById('task-modal-title').textContent = 'Edit Task';
+  document.getElementById('task-edit-id').value = t.id;
+  document.getElementById('task-group').value = t.group_folder || '';
+  document.getElementById('task-jid').value = t.chat_jid || '';
+  document.getElementById('task-stype').value = t.schedule_type || 'cron';
+  document.getElementById('task-svalue').value = t.schedule_value || '';
+  document.getElementById('task-ctx').value = t.context_mode || 'isolated';
+  document.getElementById('task-prompt').value = t.prompt || '';
+  document.getElementById('task-script').value = t.script || '';
+  document.getElementById('task-modal').classList.add('open');
+}
+
+function closeTaskModal() { document.getElementById('task-modal').classList.remove('open'); }
+
+async function saveTask() {
+  var id = document.getElementById('task-edit-id').value;
+  var body = {
+    group_folder: document.getElementById('task-group').value.trim(),
+    chat_jid: document.getElementById('task-jid').value.trim(),
+    schedule_type: document.getElementById('task-stype').value,
+    schedule_value: document.getElementById('task-svalue').value.trim(),
+    context_mode: document.getElementById('task-ctx').value,
+    prompt: document.getElementById('task-prompt').value.trim(),
+    script: document.getElementById('task-script').value.trim() || null,
+  };
+  try {
+    if (id) { await apiFetch('PATCH', '/api/tasks/'+id, body); toast('Task updated'); }
+    else { await apiFetch('POST', '/api/tasks', body); toast('Task created'); }
+    closeTaskModal(); loadTasks();
+  } catch(e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+async function patchTask(id, status) {
+  try { await apiFetch('PATCH', '/api/tasks/'+id, { status: status }); loadTasks(); }
+  catch(e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+async function delTask(id) {
+  if (!confirm('Delete this task?')) return;
+  try { await apiFetch('DELETE', '/api/tasks/'+id); toast('Task deleted'); loadTasks(); }
+  catch(e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+// ---- Brain ----
+async function loadBrain() {
+  try {
+    var type = document.getElementById('brain-filter-type').value;
+    var status = document.getElementById('brain-filter-status').value;
+    var url = '/api/brain?limit=50';
+    if (type) url += '&type='+type;
+    if (status) url += '&status='+status;
+    var entries = await fetch(url, { headers: API_TOKEN ? {'X-Auth-Token': API_TOKEN} : {} }).then(function(r){ return r.json(); });
+    document.getElementById('brain-count').textContent = entries.length;
+    var tbody = document.getElementById('brain-tbody');
+    if (!entries.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">No brain entries</td></tr>'; return; }
+    var tc = { decision:'blue', action_item:'green', insight:'yellow', follow_up:'gray' };
+    tbody.innerHTML = entries.map(function(e) {
+      var sc = e.status==='open'?'green':e.status==='done'?'gray':'red';
+      return '<tr>'
+        + '<td><span class="pill '+(tc[e.entry_type]||'gray')+'">'+esc(e.entry_type)+'</span></td>'
+        + '<td><code>'+esc(e.source_group)+'</code></td>'
+        + '<td><span class="truncate" style="max-width:360px" title="'+esc(e.content)+'">'+esc((e.content||'').slice(0,120))+'</span></td>'
+        + '<td><span class="pill '+sc+'">'+e.status+'</span></td>'
+        + '<td>'+fmt(e.created_at)+'</td>'
+        + '</tr>';
+    }).join('');
+  } catch(e) {}
+}
+
+// ---- Integrations ----
+var INTEGRATION_INFO = {
+  gmail: { label: 'Gmail', canUpload: true },
+  calendar: { label: 'Google Calendar', canUpload: true },
+  'calendar-token': { label: 'Calendar Token', canUpload: true },
+  google: { label: 'Google OAuth', canUpload: true },
+  todoist: { label: 'Todoist', canUpload: true },
+  voice: { label: 'Voice', canUpload: true },
+  x: { label: 'X / Twitter', canUpload: true },
+  contacts: { label: 'Contacts', canToggle: true },
+  pipedream: { label: 'Pipedream', canUpload: false },
+};
+
+async function loadIntegrations() {
+  try {
+    var status = await apiFetch('GET', '/api/integrations');
+    var grid = document.getElementById('integration-grid');
+    grid.innerHTML = '';
+    Object.entries(INTEGRATION_INFO).forEach(function(pair) {
+      var key = pair[0], info = pair[1];
+      var s = status[key] || { active: false, configuredAt: null };
+      var tile = document.createElement('div');
+      tile.className = 'integration-tile' + (s.active ? ' active' : '');
+      var actions = '';
+      if (info.canUpload) actions += '<button class="btn" onclick="openUpload(\''+key+'\',\''+esc(info.label)+'\')">Upload</button>';
+      if (info.canToggle) actions += '<button class="btn '+(s.active?'danger':'')+'" onclick="toggleContacts()">'+(s.active?'Disable':'Enable')+'</button>';
+      tile.innerHTML = '<div class="title">'+esc(info.label)+'</div>'
+        + '<div class="sint">'+(s.active?'● Active':'○ Not configured')+'</div>'
+        + (s.configuredAt?'<div style="font-size:10px;color:var(--muted)">'+fmt(s.configuredAt)+'</div>':'')
+        + '<div class="tile-actions">'+actions+'</div>';
+      grid.appendChild(tile);
+    });
+  } catch(e) {}
+}
+
+async function toggleContacts() {
+  try {
+    var r = await apiFetch('POST', '/api/integrations/contacts/toggle');
+    toast('Contacts ' + (r.active ? 'enabled' : 'disabled'));
+    loadIntegrations();
+  } catch(e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+function openUpload(type, label) {
+  document.getElementById('upload-modal-title').textContent = 'Upload ' + label + ' Credentials';
+  document.getElementById('upload-type').value = type;
+  document.getElementById('upload-json').value = '';
+  document.getElementById('upload-modal').classList.add('open');
+}
+
+function closeUploadModal() { document.getElementById('upload-modal').classList.remove('open'); }
+
+async function submitUpload() {
+  var type = document.getElementById('upload-type').value;
+  var jsonText = document.getElementById('upload-json').value.trim();
+  if (!jsonText) { toast('Paste JSON content first', 'err'); return; }
+  try { JSON.parse(jsonText); } catch(e) { toast('Invalid JSON', 'err'); return; }
+  try {
+    var headers = {'Content-Type':'application/json'};
+    if (API_TOKEN) headers['X-Auth-Token'] = API_TOKEN;
+    var r = await fetch('/api/integrations/'+type+'/upload', {
+      method: 'POST', headers: headers, body: jsonText
+    });
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    toast('Credentials saved successfully');
+    closeUploadModal(); loadIntegrations();
+  } catch(e) { toast('Failed: ' + e.message, 'err'); }
+}
+
+// ---- Refresh loop ----
+async function refreshAll() {
+  await Promise.allSettled([loadStatus(), loadGroups(), loadTasks(), loadBrain(), loadIntegrations()]);
+}
+
+function scheduleRefresh() {
+  clearTimeout(_refreshTimer);
+  _refreshTimer = setTimeout(function(){ refreshAll().then(scheduleRefresh); }, REFRESH_MS);
+}
+
+refreshAll().then(scheduleRefresh);
+</script>
+</body>
+</html>
