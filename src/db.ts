@@ -14,6 +14,24 @@ import {
 
 let db: Database.Database;
 
+function assertColumnsExist(
+  database: Database.Database,
+  tableName: string,
+  expectedColumns: string[],
+): void {
+  const rows = database
+    .prepare(`PRAGMA table_info(${tableName})`)
+    .all() as Array<{ name: string }>;
+  const present = new Set(rows.map((r) => r.name));
+  const missing = expectedColumns.filter((col) => !present.has(col));
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Schema validation failed for ${tableName}. Missing columns: ${missing.join(', ')}`,
+    );
+  }
+}
+
 function createSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS chats (
@@ -174,6 +192,58 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* columns already exist */
   }
+
+  // Add session health columns for Phase 0C session hygiene.
+  // Tracks consecutive agent errors per group to implement controlled backoff.
+  try {
+    database.exec(
+      `ALTER TABLE sessions ADD COLUMN error_count INTEGER DEFAULT 0`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE sessions ADD COLUMN last_error_at TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(`ALTER TABLE sessions ADD COLUMN backoff_until TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
+  // Add reply context columns for quoted message rendering
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN reply_to_message_id TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN reply_to_message_content TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Validate expected schema after migrations so partial ALTER failures
+  // surface immediately instead of causing runtime errors later.
+  assertColumnsExist(database, 'scheduled_tasks', ['context_mode', 'script']);
+  assertColumnsExist(database, 'messages', ['is_bot_message']);
+  assertColumnsExist(database, 'registered_groups', [
+    'requires_trigger',
+    'is_main',
+    'listen_only',
+  ]);
+  assertColumnsExist(database, 'chats', ['channel', 'is_group']);
 }
 
 export function initDatabase(): void {
@@ -302,7 +372,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -312,6 +382,9 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.reply_to_message_id ?? null,
+    msg.reply_to_message_content ?? null,
+    msg.reply_to_sender_name ?? null,
   );
 }
 
@@ -356,7 +429,8 @@ export function getNewMessages(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE timestamp > ? AND chat_jid IN (${placeholders})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -389,7 +463,8 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -401,6 +476,24 @@ export function getMessagesSince(
   return db
     .prepare(sql)
     .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+}
+
+/**
+ * Get the timestamp of the most recent bot message in a chat.
+ * Used as a cursor fallback when restoring agent sessions.
+ */
+export function getLastBotMessageTimestamp(
+  chatJid: string,
+  botPrefix: string,
+): string | undefined {
+  const row = db
+    .prepare(
+      `SELECT timestamp FROM messages
+       WHERE chat_jid = ? AND (is_bot_message = 1 OR content LIKE ?)
+       ORDER BY timestamp DESC LIMIT 1`,
+    )
+    .get(chatJid, `${botPrefix}:%`) as { timestamp: string } | undefined;
+  return row?.timestamp;
 }
 
 export function createTask(
@@ -576,6 +669,10 @@ export function setSession(groupFolder: string, sessionId: string): void {
   ).run(groupFolder, sessionId);
 }
 
+export function deleteSession(groupFolder: string): void {
+  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+}
+
 export function getAllSessions(): Record<string, string> {
   const rows = db
     .prepare('SELECT group_folder, session_id FROM sessions')
@@ -585,6 +682,64 @@ export function getAllSessions(): Record<string, string> {
     result[row.group_folder] = row.session_id;
   }
   return result;
+}
+
+// --- Session health (Phase 0C: poisoned-session backoff) ---
+
+export interface SessionHealth {
+  errorCount: number;
+  lastErrorAt: string | null;
+  backoffUntil: string | null;
+}
+
+export function getSessionHealth(groupFolder: string): SessionHealth {
+  const row = db
+    .prepare(
+      'SELECT error_count, last_error_at, backoff_until FROM sessions WHERE group_folder = ?',
+    )
+    .get(groupFolder) as
+    | { error_count: number; last_error_at: string | null; backoff_until: string | null }
+    | undefined;
+  return {
+    errorCount: row?.error_count ?? 0,
+    lastErrorAt: row?.last_error_at ?? null,
+    backoffUntil: row?.backoff_until ?? null,
+  };
+}
+
+/**
+ * Record an agent error for a group session.
+ * Increments the error counter, sets last_error_at, and computes a
+ * backoff_until timestamp using exponential backoff capped at MAX_BACKOFF_MS.
+ */
+export function recordSessionError(groupFolder: string): void {
+  const MAX_BACKOFF_MS = 30 * 60_000; // 30 minutes
+  const BASE_BACKOFF_MS = 60_000;     // 1 minute
+
+  const current = getSessionHealth(groupFolder);
+  const newCount = current.errorCount + 1;
+  const backoffMs = Math.min(BASE_BACKOFF_MS * Math.pow(2, newCount - 1), MAX_BACKOFF_MS);
+  const backoffUntil = new Date(Date.now() + backoffMs).toISOString();
+  const now = new Date().toISOString();
+
+  db.prepare(
+    `INSERT INTO sessions (group_folder, session_id, error_count, last_error_at, backoff_until)
+     VALUES (?, '', ?, ?, ?)
+     ON CONFLICT(group_folder) DO UPDATE SET
+       error_count = ?,
+       last_error_at = ?,
+       backoff_until = ?`,
+  ).run(groupFolder, newCount, now, backoffUntil, newCount, now, backoffUntil);
+}
+
+/**
+ * Clear the error counter and backoff for a group session (call on success).
+ */
+export function clearSessionErrors(groupFolder: string): void {
+  db.prepare(
+    `UPDATE sessions SET error_count = 0, last_error_at = NULL, backoff_until = NULL
+     WHERE group_folder = ?`,
+  ).run(groupFolder);
 }
 
 // --- Registered group accessors ---
@@ -687,6 +842,10 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+export function deleteRegisteredGroup(jid: string): void {
+  db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
 }
 
 // --- Central Brain CRUD ---

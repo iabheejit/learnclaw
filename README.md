@@ -73,6 +73,7 @@ Then run `/setup`. Claude Code handles everything: dependencies, authentication,
 - **Web access** - Search and fetch content from the Web
 - **Container isolation** - Agents are sandboxed in Docker (macOS/Linux), [Docker Sandboxes](docs/docker-sandboxes.md) (micro VM isolation), or Apple Container (macOS)
 - **Agent Swarms** - Spin up teams of specialized agents that collaborate on complex tasks
+- **Azure Claude integration** - Route API requests through Azure for cost savings (see [docs/AZURE-CLAUDE.md](docs/AZURE-CLAUDE.md))
 - **Optional integrations** - Add Gmail (`/add-gmail`) and more via skills
 
 ## Usage

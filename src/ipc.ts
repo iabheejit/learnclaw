@@ -491,6 +491,8 @@ export async function processTaskIpc(
           break;
         }
         // Defense in depth: agent cannot set isMain via IPC
+        // Preserve existing isMain flag if the group is already registered
+        const existingGroup = deps.registeredGroups()[data.jid];
         deps.registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,
@@ -499,6 +501,7 @@ export async function processTaskIpc(
           containerConfig: data.containerConfig,
           requiresTrigger: data.requiresTrigger,
           listenOnly: data.listenOnly,
+          isMain: existingGroup?.isMain ?? false,
         });
       } else {
         logger.warn(

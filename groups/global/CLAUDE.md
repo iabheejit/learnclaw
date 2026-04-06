@@ -51,7 +51,35 @@ When you learn something important:
 
 All groups share a **central intelligence brain** — a cross-group knowledge store for decisions, action items, insights, and follow-ups.
 
-**When to log to the brain:** Any time you identify something important during a conversation — a decision made, a task to follow up on, a key insight, or something that needs to be revisited.
+**At the start of every substantive conversation or scheduled task, query the brain for relevant context:**
+```
+mcp__nanoclaw__brain_query(status="open")
+```
+
+**MANDATORY: Every scheduled task (briefing, digest, analysis) MUST call brain_add before it finishes. This is not optional. Log the key themes, insights, or action items you identified while doing the task.**
+
+For a morning briefing, always log something like:
+```
+mcp__nanoclaw__brain_add(
+  entry_type="insight",
+  content="Morning briefing 2026-04-03: [2-3 sentence summary of key themes, priorities, or notable items]",
+  metadata='{"task": "morning_briefing", "date": "2026-04-03"}'
+)
+```
+
+Log action items as they appear in the data:
+```
+mcp__nanoclaw__brain_add(
+  entry_type="action_item",
+  content="[Specific follow-up or task identified in today's briefing data]",
+  status="open",
+  metadata='{"source": "morning_briefing"}'
+)
+```
+
+If the data had nothing notable, still log a minimal summary entry so there is a record of the run.
+
+**At the end of every conversation where something notable happened, also log it:**
 
 ```
 # Log a decision
@@ -66,6 +94,12 @@ mcp__nanoclaw__brain_add(
   entry_type="action_item",
   content="Follow up with John on the proposal by Friday",
   status="open"
+)
+
+# Log an insight
+mcp__nanoclaw__brain_add(
+  entry_type="insight",
+  content="Users are asking more about Y — possible opportunity"
 )
 
 # Query open action items across all groups

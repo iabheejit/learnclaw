@@ -12,12 +12,14 @@ export type WhatsAppStatus =
 
 export interface WhatsAppState {
   status: WhatsAppStatus;
-  qrDataUrl: string | null; // PNG data URL for dashboard display
+  qrString: string | null; // Raw QR string for client-side rendering
+  qrDataUrl: string | null; // PNG data URL (kept for compatibility)
   qrExpiresAt: number | null; // Unix ms when the current QR expires (~60s)
 }
 
 export const waState: WhatsAppState = {
   status: 'connecting',
+  qrString: null,
   qrDataUrl: null,
   qrExpiresAt: null,
 };

@@ -25,6 +25,14 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 
 API keys, secret keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway — which handles secret injection into containers at request time, so no keys or tokens are ever passed to containers directly. Run `onecli --help`.
 
+### Azure Claude Integration
+
+For cost savings, you can route Claude API requests through Azure's managed Anthropic endpoint instead of calling Anthropic directly. This uses direct credential mode (bypasses OneCLI proxy). See [docs/AZURE-CLAUDE.md](docs/AZURE-CLAUDE.md) for:  
+- Architecture and implementation details  
+- Configuration guide  
+- Security tradeoffs vs OneCLI  
+- Troubleshooting
+
 ## Skills
 
 Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy and guidelines.

@@ -2,6 +2,9 @@ import fs from 'fs';
 import path from 'path';
 import { logger } from './logger.js';
 
+// Resolve .env relative to this file's compiled location (dist/env.js → ../ = project root).
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
+
 /**
  * Parse the .env file and return values for the requested keys.
  * Does NOT load anything into process.env — callers decide what to
@@ -9,7 +12,7 @@ import { logger } from './logger.js';
  * so they don't leak to child processes.
  */
 export function readEnvFile(keys: string[]): Record<string, string> {
-  const envFile = path.join(process.cwd(), '.env');
+  const envFile = path.resolve(__dirname, '..', '.env');
   let content: string;
   try {
     content = fs.readFileSync(envFile, 'utf-8');
@@ -30,8 +33,9 @@ export function readEnvFile(keys: string[]): Record<string, string> {
     if (!wanted.has(key)) continue;
     let value = trimmed.slice(eqIdx + 1).trim();
     if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'")))
     ) {
       value = value.slice(1, -1);
     }

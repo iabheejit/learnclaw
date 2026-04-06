@@ -9,8 +9,10 @@ import {
   getTriggerPattern,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  MAX_MESSAGES_PER_PROMPT,
   ONECLI_URL,
   POLL_INTERVAL,
+  PROJECT_ROOT,
   TIMEZONE,
 } from './config.js';
 import './channels/index.js';
@@ -33,6 +35,7 @@ import {
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getLastBotMessageTimestamp,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -40,13 +43,18 @@ import {
   setRegisteredGroup,
   setRouterState,
   setSession,
+  deleteSession,
   storeChatMetadata,
   storeMessage,
+  getSessionHealth,
+  recordSessionError,
+  clearSessionErrors,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { startWebServer } from './web-server.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -61,6 +69,8 @@ import {
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { checkOutbound } from './outbound-guard.js';
+import { runPreflight } from './preflight.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -75,6 +85,18 @@ const channels: Channel[] = [];
 const queue = new GroupQueue();
 
 const onecli = new OneCLI({ url: ONECLI_URL });
+
+/**
+ * Get the cursor timestamp for a chat, recovering to the last bot message
+ * timestamp when the stored cursor is empty (prevents flooding on first run).
+ */
+function getOrRecoverCursor(chatJid: string): string {
+  const stored = lastAgentTimestamp[chatJid];
+  if (stored) return stored;
+  // No cursor yet: start from just after the last bot message to avoid
+  // replaying the entire history into the first prompt.
+  return getLastBotMessageTimestamp(chatJid, ASSISTANT_NAME) ?? '';
+}
 
 function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
   if (group.isMain) return;
@@ -208,14 +230,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  const sinceTimestamp = getOrRecoverCursor(chatJid);
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
     ASSISTANT_NAME,
+    MAX_MESSAGES_PER_PROMPT,
   );
 
   if (missedMessages.length === 0) return true;
+
+  // Phase 0C: Check session backoff — skip processing if group is in error backoff window
+  const health = getSessionHealth(group.folder);
+  if (health.backoffUntil && new Date(health.backoffUntil) > new Date()) {
+    logger.warn(
+      {
+        group: group.name,
+        backoffUntil: health.backoffUntil,
+        errorCount: health.errorCount,
+      },
+      'Session in backoff period — skipping agent spawn, will retry after backoff expires',
+    );
+    return true; // messages stay in DB, will be picked up after backoff
+  }
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
@@ -272,8 +309,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+        const guard = checkOutbound(chatJid, text);
+        if (guard === 'allow') {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        } else {
+          logger.warn(
+            { group: group.name, chatJid, reason: guard },
+            'Agent output suppressed by outbound guard',
+          );
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -292,6 +337,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
+    // Phase 0C: record error for backoff tracking
+    recordSessionError(group.folder);
+
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
@@ -311,6 +359,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  // Phase 0C: clear error counter on success
+  clearSessionErrors(group.folder);
   return true;
 }
 
@@ -385,6 +435,16 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
+      // Detect stale/expired session and clear it so the next retry starts fresh
+      const err = output.error ?? '';
+      if (/session.*not found|no conversation found/i.test(err)) {
+        logger.warn(
+          { group: group.name },
+          'Stale session detected — clearing session ID for next retry',
+        );
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+      }
       return 'error';
     }
 
@@ -466,8 +526,9 @@ async function startMessageLoop(): Promise<void> {
           // context that accumulated between triggers is included.
           const allPending = getMessagesSince(
             chatJid,
-            lastAgentTimestamp[chatJid] || '',
+            getOrRecoverCursor(chatJid),
             ASSISTANT_NAME,
+            MAX_MESSAGES_PER_PROMPT,
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
@@ -503,17 +564,32 @@ async function startMessageLoop(): Promise<void> {
 /**
  * Startup recovery: check for unprocessed messages in registered groups.
  * Handles crash between advancing lastTimestamp and processing messages.
+ * Only recovers messages from the last RECOVERY_MAX_AGE_MS to prevent
+ * flooding groups with replies to a large backlog after extended downtime.
  */
+const RECOVERY_MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes
+
 function recoverPendingMessages(): void {
+  const cutoff = new Date(Date.now() - RECOVERY_MAX_AGE_MS).toISOString();
+
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
     // Listen-only groups never process messages, skip recovery
     if (group.listenOnly) continue;
 
-    const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+    const storedTimestamp = lastAgentTimestamp[chatJid] || '';
+    // Use the more recent of stored timestamp or cutoff to avoid replaying old backlog
+    const sinceTimestamp =
+      storedTimestamp > cutoff ? storedTimestamp : cutoff;
+
+    // Advance the stored timestamp so processGroup also skips stale messages
+    if (sinceTimestamp > storedTimestamp) {
+      lastAgentTimestamp[chatJid] = sinceTimestamp;
+    }
+
+    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME, MAX_MESSAGES_PER_PROMPT);
     if (pending.length > 0) {
       logger.info(
-        { group: group.name, pendingCount: pending.length },
+        { group: group.name, pendingCount: pending.length, cutoff },
         'Recovery: found unprocessed messages',
       );
       queue.enqueueMessageCheck(chatJid);
@@ -528,9 +604,14 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+  startWebServer();
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Phase 0B: Startup preflight — validate credentials and auth before connecting.
+  // On failure, safe mode is activated (outbound blocked, service continues).
+  await runPreflight();
 
   // Ensure OneCLI agents exist for all registered groups.
   // Recovers from missed creates (e.g. OneCLI was down at registration time).
@@ -572,7 +653,7 @@ async function main(): Promise<void> {
       const result = await startRemoteControl(
         msg.sender,
         chatJid,
-        process.cwd(),
+        PROJECT_ROOT,
       );
       if (result.ok) {
         await channel.sendMessage(chatJid, result.url);
@@ -667,13 +748,26 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      if (text) {
+        const guard = checkOutbound(jid, text);
+        if (guard === 'allow') {
+          await channel.sendMessage(jid, text);
+        } else {
+          logger.warn({ jid, reason: guard }, 'Scheduler outbound suppressed by guard');
+        }
+      }
     },
   });
   startIpcWatcher({
     sendMessage: (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      // IPC is an explicit user/admin action — only kill switch applies
+      const guard = checkOutbound(jid, text);
+      if (guard === 'kill-switch') {
+        logger.warn({ jid }, 'IPC send suppressed — kill switch active');
+        return Promise.resolve();
+      }
       return channel.sendMessage(jid, text);
     },
     registeredGroups: () => registeredGroups,

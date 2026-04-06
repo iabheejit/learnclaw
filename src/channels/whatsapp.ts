@@ -8,7 +8,11 @@ import fs from 'fs';
 import path from 'path';
 
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
+  fetchLatestBaileysVersion,
+  isLidUser,
+  jidNormalizedUser,
   makeCacheableSignalKeyStore,
   proto,
   useMultiFileAuthState,
@@ -24,16 +28,19 @@ import {
   updateChatName,
 } from '../db.js';
 import { logger } from '../logger.js';
+import { isKillSwitchActive } from '../outbound-guard.js';
 import {
   Channel,
   NewMessage,
   OnChatMetadata,
   OnInboundMessage,
 } from '../types.js';
+import { waState } from '../wa-state.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 
 const AUTH_DIR = path.join(STORE_DIR, 'auth');
 const ONE_SECOND = 1000;
+
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * ONE_SECOND;
 
 // Quiet baileys logger — it's very chatty
@@ -48,7 +55,8 @@ class WhatsAppChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
-  // LID to phone number mapping (WhatsApp now sends LID JIDs for self-chats)
+  // LID to phone number mapping (WhatsApp sends @lid JIDs for DMs; populated from
+  // own user info on connect + all contacts from contacts.upsert sync)
   private lidToPhoneMap: Record<string, string> = {};
 
   private onMessage: OnInboundMessage;
@@ -81,6 +89,11 @@ class WhatsAppChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
+    // Kill switch: also blocks queued messages from flushing on reconnect
+    if (isKillSwitchActive()) {
+      logger.warn({ jid }, 'WA channel: kill switch active — send suppressed');
+      return;
+    }
     if (!this.connected || !this.sock) {
       this.outgoingQueue.push({ jid, text });
       logger.info(
@@ -173,6 +186,7 @@ class WhatsAppChannel implements Channel {
       logger.debug({ lidJid: jid, phoneJid }, 'Translated LID to phone JID');
       return phoneJid;
     }
+    logger.warn({ lidJid: jid }, 'Unresolved @lid JID — contact not yet in map');
     return jid;
   }
 
@@ -222,6 +236,15 @@ class WhatsAppChannel implements Channel {
     const myGen = ++this.connGen; // capture generation at connection start
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
 
+    let version: [number, number, number] | undefined;
+    try {
+      const fetched = await fetchLatestBaileysVersion();
+      version = fetched.version;
+      logger.info({ version: version.join('.') }, 'Fetched latest WA Web version');
+    } catch {
+      logger.warn('Failed to fetch latest WA version, using Baileys default');
+    }
+
     const sock = makeWASocket({
       auth: {
         creds: state.creds,
@@ -229,7 +252,8 @@ class WhatsAppChannel implements Channel {
       },
       printQRInTerminal: false,
       logger: baileysLogger,
-      browser: ['NanoClaw', 'Chrome', '1.0.0'],
+      version,
+      browser: Browsers.macOS('Chrome'),
     });
     this.sock = sock;
 
@@ -241,6 +265,10 @@ class WhatsAppChannel implements Channel {
         logger.error(
           'WhatsApp QR code required — re-run whatsapp-auth setup to re-authenticate.',
         );
+        waState.status = 'needs_qr';
+        waState.qrString = qr;
+        waState.qrDataUrl = null;
+        waState.qrExpiresAt = Date.now() + 60_000;
         return;
       }
 
@@ -262,10 +290,21 @@ class WhatsAppChannel implements Channel {
         );
 
         if (shouldReconnect && !this.shuttingDown) {
-          logger.info({ reconnectIn: this.reconnectDelay }, 'Reconnecting to WhatsApp...');
+          waState.status = 'connecting';
+          waState.qrString = null;
+          waState.qrDataUrl = null;
+          waState.qrExpiresAt = null;
+          logger.info(
+            { reconnectIn: this.reconnectDelay },
+            'Reconnecting to WhatsApp...',
+          );
           setTimeout(() => {
             if (this.sock) {
-              try { this.sock.end(undefined); } catch { /* best-effort */ }
+              try {
+                this.sock.end(undefined);
+              } catch {
+                /* best-effort */
+              }
               this.sock = null;
             }
             this.connectInternal().catch((err) =>
@@ -273,8 +312,15 @@ class WhatsAppChannel implements Channel {
             );
           }, this.reconnectDelay);
           // Exponential backoff, capped at MAX_RECONNECT_DELAY
-          this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.MAX_RECONNECT_DELAY);
+          this.reconnectDelay = Math.min(
+            this.reconnectDelay * 2,
+            this.MAX_RECONNECT_DELAY,
+          );
         } else if (!this.shuttingDown) {
+          waState.status = 'disconnected';
+          waState.qrString = null;
+          waState.qrDataUrl = null;
+          waState.qrExpiresAt = null;
           logger.error(
             'WhatsApp session logged out — run whatsapp-auth setup to re-authenticate.',
           );
@@ -282,6 +328,10 @@ class WhatsAppChannel implements Channel {
       } else if (connection === 'open') {
         this.connected = true;
         this.reconnectDelay = 5 * ONE_SECOND; // reset backoff on success
+        waState.status = 'connected';
+        waState.qrString = null;
+        waState.qrDataUrl = null;
+        waState.qrExpiresAt = null;
         logger.info('Connected to WhatsApp');
 
         // Build LID → phone mapping from auth state for self-chat translation
@@ -331,6 +381,44 @@ class WhatsAppChannel implements Channel {
     });
 
     sock.ev.on('creds.update', saveCreds);
+
+    // Build LID→phone map from contact sync so DMs using @lid JIDs can be resolved
+    const addContactToLidMap = (contacts: Array<{ id: string; lid?: string; jid?: string }>) => {
+      for (const contact of contacts) {
+        const phoneJid = contact.jid
+          ? jidNormalizedUser(contact.jid)
+          : !isLidUser(contact.id)
+            ? jidNormalizedUser(contact.id)
+            : null;
+        const lidRaw = contact.lid ?? (isLidUser(contact.id) ? contact.id : null);
+        const lid = lidRaw?.split('@')[0].split(':')[0];
+        if (lid && phoneJid && !this.lidToPhoneMap[lid]) {
+          this.lidToPhoneMap[lid] = phoneJid;
+          logger.debug({ lid, phoneJid }, 'Contact LID→phone mapped');
+        }
+      }
+    };
+
+    sock.ev.on('contacts.upsert', (contacts) => {
+      if (myGen !== this.connGen) return;
+      addContactToLidMap(contacts);
+    });
+
+    sock.ev.on('contacts.update', (updates) => {
+      if (myGen !== this.connGen) return;
+      addContactToLidMap(updates as Array<{ id: string; lid?: string; jid?: string }>);
+    });
+
+    // chats.phoneNumberShare fires when WA explicitly shares a LID↔phone binding
+    sock.ev.on('chats.phoneNumberShare', ({ lid, jid }) => {
+      if (myGen !== this.connGen) return;
+      const lidKey = lid.split('@')[0].split(':')[0];
+      const phoneJid = jidNormalizedUser(jid);
+      if (lidKey && phoneJid) {
+        this.lidToPhoneMap[lidKey] = phoneJid;
+        logger.info({ lid: lidKey, phoneJid }, 'LID→phone bound via phoneNumberShare');
+      }
+    });
 
     sock.ev.on('messages.upsert', ({ messages }) => {
       if (myGen !== this.connGen) return; // stale socket — ignore

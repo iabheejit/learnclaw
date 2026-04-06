@@ -239,14 +239,28 @@ Notes:
 
 ### Removing a Group
 
-1. Read `/workspace/project/data/registered_groups.json`
-2. Remove the entry for that group
-3. Write the updated JSON back
-4. The group folder and its files remain (don't delete them)
+Remove groups from SQLite:
+
+```bash
+sqlite3 /workspace/project/store/messages.db "
+  DELETE FROM registered_groups
+  WHERE jid = '<group-jid>';
+"
+```
+
+The group folder and its files remain (don't delete them).
 
 ### Listing Groups
 
-Read `/workspace/project/data/registered_groups.json` and format it nicely.
+Query SQLite and format the results nicely:
+
+```bash
+sqlite3 /workspace/project/store/messages.db "
+  SELECT jid, name, folder, trigger_pattern, requires_trigger, is_main, listen_only, added_at
+  FROM registered_groups
+  ORDER BY is_main DESC, added_at ASC;
+"
+```
 
 ---
 
@@ -258,7 +272,7 @@ You can read and write to `/workspace/project/groups/global/CLAUDE.md` for facts
 
 ## Scheduling for Other Groups
 
-When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from `registered_groups.json`:
+When scheduling tasks for other groups, use the `target_group_jid` parameter with the group's JID from the SQLite `registered_groups` table:
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363336345536173@g.us")`
 
 The task will run in that group's context with access to their files and memory.
@@ -316,14 +330,36 @@ The brain stores cross-group intelligence in four categories:
 
 ### Brain MCP Tools
 
+**At the start of every substantive conversation, query the brain for relevant context:**
 ```
-# Add an entry
+mcp__nanoclaw__brain_query(status="open")
+```
+
+**At the end of every conversation where something notable happened, log it:**
+```
+# Log a decision
 mcp__nanoclaw__brain_add(
   entry_type="decision",
   content="Decided to focus Q2 on X",
   metadata='{"group": "cos", "date": "2026-03-27"}'
 )
 
+# Log an action item
+mcp__nanoclaw__brain_add(
+  entry_type="action_item",
+  content="Follow up with John on the proposal by Friday",
+  status="open"
+)
+
+# Log an insight
+mcp__nanoclaw__brain_add(
+  entry_type="insight",
+  content="Users are asking more about Y — possible opportunity"
+)
+```
+
+**Other brain operations:**
+```
 # Query entries
 mcp__nanoclaw__brain_query(status="open", entry_type="action_item")
 mcp__nanoclaw__brain_query(source_group="whatsapp_cos", since="2026-03-20T00:00:00")

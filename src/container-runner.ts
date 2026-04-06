@@ -2,8 +2,9 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -14,6 +15,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   ONECLI_URL,
+  PROJECT_ROOT,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -27,6 +29,7 @@ import {
 import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { z } from 'zod';
 
 const onecli = new OneCLI({ url: ONECLI_URL });
 
@@ -52,6 +55,19 @@ export interface ContainerOutput {
   error?: string;
 }
 
+const SESSION_ID_REGEX = /^[A-Za-z0-9._:-]{1,256}$/;
+
+const ContainerOutputSchema = z.object({
+  status: z.enum(['success', 'error']),
+  result: z.string().nullable(),
+  newSessionId: z.string().regex(SESSION_ID_REGEX).optional(),
+  error: z.string().optional(),
+});
+
+function parseContainerOutput(jsonStr: string): ContainerOutput {
+  return ContainerOutputSchema.parse(JSON.parse(jsonStr));
+}
+
 interface VolumeMount {
   hostPath: string;
   containerPath: string;
@@ -64,7 +80,7 @@ function buildVolumeMounts(
   isScheduledTask?: boolean,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
-  const projectRoot = process.cwd();
+  const projectRoot = PROJECT_ROOT;
   const groupDir = resolveGroupFolderPath(group.folder);
 
   if (isMain) {
@@ -171,7 +187,7 @@ function buildVolumeMounts(
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  const skillsSrc = path.join(PROJECT_ROOT, 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
     for (const skillDir of fs.readdirSync(skillsSrc)) {
@@ -242,7 +258,50 @@ function buildVolumeMounts(
     mounts.push(...validatedMounts);
   }
 
+  // NanoClaw config dir (~/.config/nanoclaw/) — mounted read-only into all containers.
+  // Contains google-credentials.json, google-token.json, mcp-servers.json, etc.
+  // The Google MCP server and other tools read credentials from this path.
+  const nanoclawConfigDir = path.join(os.homedir(), '.config', 'nanoclaw');
+  if (fs.existsSync(nanoclawConfigDir)) {
+    mounts.push({
+      hostPath: nanoclawConfigDir,
+      containerPath: '/home/node/.config/nanoclaw',
+      readonly: true,
+    });
+  }
+
+  // Individual credential files for existing MCP integrations (read-only).
+  const credFiles: Array<[string, string]> = [
+    [path.join(os.homedir(), '.gmail-mcp'), '/home/node/.gmail-mcp'],
+    [path.join(os.homedir(), '.calendar-mcp'), '/home/node/.calendar-mcp'],
+    [path.join(os.homedir(), '.todoist-mcp'), '/home/node/.todoist-mcp'],
+    [path.join(os.homedir(), '.voice-mcp'), '/home/node/.voice-mcp'],
+  ];
+  for (const [hostPath, containerPath] of credFiles) {
+    if (fs.existsSync(hostPath)) {
+      mounts.push({ hostPath, containerPath, readonly: true });
+    }
+  }
+
   return mounts;
+}
+
+/** Redact -e KEY=VALUE entries from a docker args array for safe logging. */
+function redactContainerArgs(args: string[]): string {
+  const redacted: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '-e' && i + 1 < args.length) {
+      const kv = args[i + 1];
+      const eq = kv.indexOf('=');
+      if (eq !== -1) {
+        redacted.push('-e', `${kv.slice(0, eq)}=[REDACTED]`);
+        i++;
+        continue;
+      }
+    }
+    redacted.push(args[i]);
+  }
+  return redacted.join(' ');
 }
 
 async function buildContainerArgs(
@@ -251,6 +310,9 @@ async function buildContainerArgs(
   agentIdentifier?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  const allowDirectFallback = ['1', 'true', 'yes'].includes(
+    (process.env.NANOCLAW_ALLOW_DIRECT_CREDENTIAL_FALLBACK || '').toLowerCase(),
+  );
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -268,6 +330,34 @@ async function buildContainerArgs(
       { containerName },
       'OneCLI gateway not reachable — container will have no credentials',
     );
+
+    if (!allowDirectFallback) {
+      throw new Error(
+        'OneCLI unavailable and direct credential fallback is disabled. Set NANOCLAW_ALLOW_DIRECT_CREDENTIAL_FALLBACK=1 to allow degraded mode.',
+      );
+    }
+
+    logger.warn(
+      { containerName },
+      'Degraded mode enabled: injecting credentials directly because OneCLI is unavailable',
+    );
+
+    // Fallback: pass credentials directly when OneCLI is unavailable
+    if (process.env.ANTHROPIC_API_KEY) {
+      args.push('-e', `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY}`);
+      logger.info({ containerName }, 'Injecting ANTHROPIC_API_KEY directly (OneCLI fallback)');
+    }
+    if (process.env.AZURE_CLAUDE_ENDPOINT) {
+      args.push('-e', `ANTHROPIC_BASE_URL=${process.env.AZURE_CLAUDE_ENDPOINT}`);
+      logger.info({ containerName }, 'Injecting ANTHROPIC_BASE_URL from AZURE_CLAUDE_ENDPOINT (OneCLI fallback)');
+      // Azure endpoint requires a specific model name; default to claude-sonnet-4-5
+      const azureModel = process.env.AZURE_MODEL ?? 'claude-sonnet-4-5';
+      args.push('-e', `CLAUDE_MODEL=${azureModel}`);
+      logger.info({ containerName, model: azureModel }, 'Injecting CLAUDE_MODEL for Azure endpoint');
+    } else if (process.env.ANTHROPIC_BASE_URL) {
+      args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
+      logger.info({ containerName }, 'Injecting ANTHROPIC_BASE_URL directly (OneCLI fallback)');
+    }
   }
 
   // Runtime-specific args for host gateway resolution
@@ -314,11 +404,27 @@ export async function runContainerAgent(
   const agentIdentifier = input.isMain
     ? undefined
     : group.folder.toLowerCase().replace(/_/g, '-');
-  const containerArgs = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentIdentifier,
-  );
+  let containerArgs: string[];
+  try {
+    containerArgs = await buildContainerArgs(
+      mounts,
+      containerName,
+      agentIdentifier,
+    );
+  } catch (err) {
+    logger.error(
+      { group: group.name, containerName, err },
+      'Failed to build container arguments',
+    );
+    return {
+      status: 'error',
+      result: null,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'Failed to build container arguments',
+    };
+  }
 
   logger.debug(
     {
@@ -328,7 +434,7 @@ export async function runContainerAgent(
         (m) =>
           `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
       ),
-      containerArgs: containerArgs.join(' '),
+      containerArgs: redactContainerArgs(containerArgs),
     },
     'Container mount configuration',
   );
@@ -398,7 +504,7 @@ export async function runContainerAgent(
           parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
 
           try {
-            const parsed: ContainerOutput = JSON.parse(jsonStr);
+            const parsed = parseContainerOutput(jsonStr);
             if (parsed.newSessionId) {
               newSessionId = parsed.newSessionId;
             }
@@ -453,15 +559,15 @@ export async function runContainerAgent(
         { group: group.name, containerName },
         'Container timeout, stopping gracefully',
       );
-      exec(stopContainer(containerName), { timeout: 15000 }, (err) => {
-        if (err) {
-          logger.warn(
-            { group: group.name, containerName, err },
-            'Graceful stop failed, force killing',
-          );
-          container.kill('SIGKILL');
-        }
-      });
+      try {
+        stopContainer(containerName);
+      } catch (err) {
+        logger.warn(
+          { group: group.name, containerName, err },
+          'Graceful stop failed, force killing',
+        );
+        container.kill('SIGKILL');
+      }
     };
 
     let timeout = setTimeout(killOnTimeout, timeoutMs);
@@ -558,7 +664,7 @@ export async function runContainerAgent(
         }
         logLines.push(
           `=== Container Args ===`,
-          containerArgs.join(' '),
+          redactContainerArgs(containerArgs),
           ``,
           `=== Mounts ===`,
           mounts
@@ -645,7 +751,7 @@ export async function runContainerAgent(
           jsonLine = lines[lines.length - 1];
         }
 
-        const output: ContainerOutput = JSON.parse(jsonLine);
+        const output = parseContainerOutput(jsonLine);
 
         logger.info(
           {

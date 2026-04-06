@@ -4,6 +4,10 @@ import path from 'path';
 import { readEnvFile } from './env.js';
 import { isValidTimezone } from './timezone.js';
 
+// Resolve project root relative to this file's location (dist/config.js → ../ = project root).
+// Using import.meta.url ensures correctness regardless of process.cwd().
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
+
 // Read config values from .env (falls back to process.env).
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
@@ -21,7 +25,7 @@ export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // Absolute paths needed for container mounts
-const PROJECT_ROOT = process.cwd();
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 const HOME_DIR = process.env.HOME || os.homedir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
@@ -40,6 +44,7 @@ export const SENDER_ALLOWLIST_PATH = path.join(
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
+export { PROJECT_ROOT };
 
 export const CONTAINER_IMAGE =
   process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
@@ -58,6 +63,10 @@ export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10);
 export const MAX_CONCURRENT_CONTAINERS = Math.max(
   1,
   parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5,
+);
+export const MAX_MESSAGES_PER_PROMPT = Math.max(
+  1,
+  parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10),
 );
 
 function escapeRegex(str: string): string {

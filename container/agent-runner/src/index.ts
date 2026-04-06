@@ -20,6 +20,42 @@ import { execFile } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+// ── Dynamic MCP server loading ─────────────────────────────────────────────
+// Reads ~/.config/nanoclaw/mcp-servers.json (mounted from host at
+// /home/node/.config/nanoclaw/mcp-servers.json) and merges any declared
+// servers alongside the built-in nanoclaw IPC server.
+
+const EXTRA_MCP_CONFIG = '/home/node/.config/nanoclaw/mcp-servers.json';
+
+interface McpServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+interface McpServersFile {
+  mcpServers?: Record<string, McpServerConfig>;
+}
+
+function loadExtraMcpServers(): Record<string, McpServerConfig> {
+  try {
+    if (!fs.existsSync(EXTRA_MCP_CONFIG)) return {};
+    const raw = fs.readFileSync(EXTRA_MCP_CONFIG, 'utf-8');
+    const parsed: McpServersFile = JSON.parse(raw);
+    if (!parsed.mcpServers || typeof parsed.mcpServers !== 'object') return {};
+    log(`Loaded ${Object.keys(parsed.mcpServers).length} extra MCP server(s) from config`);
+    return parsed.mcpServers;
+  } catch (err) {
+    log(`Failed to load extra MCP servers: ${err instanceof Error ? err.message : String(err)}`);
+    return {};
+  }
+}
+
+function loadExtraMcpServerNames(): string[] {
+  const servers = loadExtraMcpServers();
+  return Object.keys(servers).map((name) => `mcp__${name}__*`);
+}
+
 interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -391,9 +427,16 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Hard-pin model at runtime to avoid stale resumed-session model selection.
+  const forcedModel = process.env.CLAUDE_MODEL || process.env.AZURE_MODEL;
+  if (forcedModel) {
+    log(`Forcing model: ${forcedModel}`);
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
+      model: forcedModel,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -409,7 +452,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        ...loadExtraMcpServerNames(),
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -425,6 +469,7 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...loadExtraMcpServers(),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],

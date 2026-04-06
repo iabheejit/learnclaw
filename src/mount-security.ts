@@ -57,13 +57,13 @@ export function loadMountAllowlist(): MountAllowlist | null {
   }
 
   if (allowlistLoadError !== null) {
-    // Already tried and failed, don't spam logs
+    // Already tried and failed with a parse/structural error, don't spam logs
     return null;
   }
 
   try {
     if (!fs.existsSync(MOUNT_ALLOWLIST_PATH)) {
-      allowlistLoadError = `Mount allowlist not found at ${MOUNT_ALLOWLIST_PATH}`;
+      // Don't cache "file not found" — the file may be created later
       logger.warn(
         { path: MOUNT_ALLOWLIST_PATH },
         'Mount allowlist not found - additional mounts will be BLOCKED. ' +
@@ -212,6 +212,11 @@ function isValidContainerPath(containerPath: string): boolean {
 
   // Must not be empty
   if (!containerPath || containerPath.trim() === '') {
+    return false;
+  }
+
+  // Must not contain ':' — prevents Docker -v option injection (e.g. 'repo:rw')
+  if (containerPath.includes(':')) {
     return false;
   }
 

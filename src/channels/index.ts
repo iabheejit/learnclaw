@@ -9,5 +9,5 @@
 
 // telegram
 
-// whatsapp
+// whatsapp — Baileys runs on the server, requires store/auth/ creds
 import './whatsapp.js';
