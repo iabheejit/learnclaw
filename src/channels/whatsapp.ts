@@ -70,6 +70,8 @@ class WhatsAppChannel implements Channel {
   private reconnectDelay = 5 * ONE_SECOND;
   private readonly MAX_RECONNECT_DELAY = 5 * 60 * ONE_SECOND; // cap at 5 min
   private readonly QR_RETRY_DELAY = 30 * ONE_SECOND; // wait before showing a fresh QR
+  private readonly MAX_QR_ATTEMPTS = 3; // stop after N unscanned QR cycles
+  private qrAttempts = 0; // how many QR cycles expired without being scanned
   private connGen = 0; // monotonically increasing generation to drop stale events
 
   async connect(): Promise<void> {
@@ -305,14 +307,20 @@ class WhatsAppChannel implements Channel {
 
         if (!this.shuttingDown) {
           if (this.sock) {
-            try { this.sock.end(undefined); } catch { /* best-effort */ }
+            try {
+              this.sock.end(undefined);
+            } catch {
+              /* best-effort */
+            }
             this.sock = null;
           }
 
           if (reason === DisconnectReason.loggedOut) {
             // Session invalidated (stale, server eviction, manual unlink, etc.).
             // Wipe creds so next connectInternal() gets a fresh QR for re-auth.
-            logger.warn('WhatsApp session invalidated (401) — wiping stale credentials and requesting fresh QR');
+            logger.warn(
+              'WhatsApp session invalidated (401) — wiping stale credentials and requesting fresh QR',
+            );
             this.wipeAuthCredentials();
             waState.status = 'needs_qr';
             waState.qrString = null;
@@ -322,6 +330,34 @@ class WhatsAppChannel implements Channel {
             setTimeout(() => {
               this.connectInternal().catch((err) =>
                 logger.error({ err }, 'Failed to reconnect after 401'),
+              );
+            }, this.QR_RETRY_DELAY);
+          } else if (reason === 408) {
+            // QR expired without being scanned — track attempts
+            this.qrAttempts++;
+            if (this.qrAttempts >= this.MAX_QR_ATTEMPTS) {
+              logger.warn(
+                { qrAttempts: this.qrAttempts },
+                'QR expired too many times without scan — stopping reconnects. Restart service or re-auth manually.',
+              );
+              waState.status = 'needs_qr';
+              waState.qrString = null;
+              waState.qrDataUrl = null;
+              waState.qrExpiresAt = null;
+              return; // stop reconnecting
+            }
+            logger.info(
+              {
+                qrAttempt: this.qrAttempts,
+                maxAttempts: this.MAX_QR_ATTEMPTS,
+                reconnectIn: this.QR_RETRY_DELAY,
+              },
+              'QR expired, retrying...',
+            );
+            waState.status = 'connecting';
+            setTimeout(() => {
+              this.connectInternal().catch((err) =>
+                logger.error({ err }, 'Failed to reconnect for QR'),
               );
             }, this.QR_RETRY_DELAY);
           } else {
@@ -348,6 +384,7 @@ class WhatsAppChannel implements Channel {
       } else if (connection === 'open') {
         this.connected = true;
         this.reconnectDelay = 5 * ONE_SECOND; // reset backoff on success
+        this.qrAttempts = 0; // reset QR attempt counter on successful connect
         waState.status = 'connected';
         waState.qrString = null;
         waState.qrDataUrl = null;

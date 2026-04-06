@@ -13,11 +13,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { ASSISTANT_NAME } from './config.js';
-import {
-  getAllRegisteredGroups,
-  getAllTasks,
-  getMessagesSince,
-} from './db.js';
+import { getAllRegisteredGroups, getAllTasks, getMessagesSince } from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { waState } from './wa-state.js';
@@ -51,18 +47,36 @@ const CREDENTIAL_PATHS: Record<string, string> = {
   todoist: path.join(os.homedir(), '.todoist-mcp'),
   voice: path.join(os.homedir(), '.voice-mcp'),
   x: path.join(os.homedir(), '.x-mcp'),
-  google: path.join(os.homedir(), '.config', 'nanoclaw', 'google-credentials.json'),
+  google: path.join(
+    os.homedir(),
+    '.config',
+    'nanoclaw',
+    'google-credentials.json',
+  ),
 };
 
-const CONTACTS_TOGGLE_FILE = path.join(os.homedir(), '.config', 'nanoclaw', 'contacts-enabled');
+const CONTACTS_TOGGLE_FILE = path.join(
+  os.homedir(),
+  '.config',
+  'nanoclaw',
+  'contacts-enabled',
+);
 
 /** Ensure the ~/.config/nanoclaw directory exists. */
 function ensureNanoclawConfigDir(): void {
-  fs.mkdirSync(path.join(os.homedir(), '.config', 'nanoclaw'), { recursive: true });
+  fs.mkdirSync(path.join(os.homedir(), '.config', 'nanoclaw'), {
+    recursive: true,
+  });
 }
 
-function getIntegrationStatus(): Record<string, { active: boolean; configuredAt: string | null }> {
-  const result: Record<string, { active: boolean; configuredAt: string | null }> = {};
+function getIntegrationStatus(): Record<
+  string,
+  { active: boolean; configuredAt: string | null }
+> {
+  const result: Record<
+    string,
+    { active: boolean; configuredAt: string | null }
+  > = {};
 
   for (const [key, credPath] of Object.entries(CREDENTIAL_PATHS)) {
     try {
@@ -74,11 +88,16 @@ function getIntegrationStatus(): Record<string, { active: boolean; configuredAt:
   }
 
   // Pipedream — check OAuth credentials present in process env
-  const hasPipedream = !!(process.env.PIPEDREAM_CLIENT_ID && process.env.PIPEDREAM_CLIENT_SECRET);
+  const hasPipedream = !!(
+    process.env.PIPEDREAM_CLIENT_ID && process.env.PIPEDREAM_CLIENT_SECRET
+  );
   result['pipedream'] = { active: hasPipedream, configuredAt: null };
 
   // Contacts — toggled via marker file
-  result['contacts'] = { active: fs.existsSync(CONTACTS_TOGGLE_FILE), configuredAt: null };
+  result['contacts'] = {
+    active: fs.existsSync(CONTACTS_TOGGLE_FILE),
+    configuredAt: null,
+  };
 
   return result;
 }
@@ -112,7 +131,10 @@ function timingSafeCompare(a: string, b: string): boolean {
 function isAuthorised(req: http.IncomingMessage, authToken: string): boolean {
   if (!authToken) return true; // No token configured — open (CF Access protects externally)
   const raw = req.headers['x-auth-token'] ?? req.headers['authorization'] ?? '';
-  const provided = (Array.isArray(raw) ? raw[0] : raw).replace(/^Bearer\s+/i, '');
+  const provided = (Array.isArray(raw) ? raw[0] : raw).replace(
+    /^Bearer\s+/i,
+    '',
+  );
   return timingSafeCompare(provided, authToken);
 }
 
@@ -192,127 +214,140 @@ async function handleRequest(
 ): Promise<void> {
   const { pathname } = url;
 
-    // /health — no auth, for monitoring and the tunnel keepalive check
-    if (req.method === 'GET' && pathname === '/health') {
+  // /health — no auth, for monitoring and the tunnel keepalive check
+  if (req.method === 'GET' && pathname === '/health') {
+    return json(res, {
+      status: 'ok',
+      uptime: Math.floor(process.uptime()),
+      timestamp: new Date().toISOString(),
+      whatsapp: waState.status,
+    });
+  }
+
+  // All /api/* routes require token auth
+  if (pathname.startsWith('/api/')) {
+    if (!isAuthorised(req, authToken)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+
+    // GET /api/status
+    if (req.method === 'GET' && pathname === '/api/status') {
+      const groups = getAllRegisteredGroups();
+      const groupValues = Object.values(groups);
       return json(res, {
-        status: 'ok',
+        whatsapp: waState.status,
+        qrExpiresAt: waState.qrExpiresAt,
         uptime: Math.floor(process.uptime()),
         timestamp: new Date().toISOString(),
-        whatsapp: waState.status,
+        groups: {
+          total: groupValues.length,
+          active: groupValues.filter((g) => !g.listenOnly).length,
+          listenOnly: groupValues.filter((g) => g.listenOnly).length,
+        },
       });
     }
 
-    // All /api/* routes require token auth
-    if (pathname.startsWith('/api/')) {
-      if (!isAuthorised(req, authToken)) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthorized' }));
-        return;
-      }
+    // GET /api/auth/qr
+    if (req.method === 'GET' && pathname === '/api/auth/qr') {
+      return json(res, {
+        status: waState.status,
+        qrString: waState.qrString,
+        qrDataUrl: waState.qrDataUrl,
+        qrExpiresAt: waState.qrExpiresAt,
+      });
+    }
 
-      // GET /api/status
-      if (req.method === 'GET' && pathname === '/api/status') {
-        const groups = getAllRegisteredGroups();
-        const groupValues = Object.values(groups);
-        return json(res, {
-          whatsapp: waState.status,
-          qrExpiresAt: waState.qrExpiresAt,
-          uptime: Math.floor(process.uptime()),
-          timestamp: new Date().toISOString(),
-          groups: {
-            total: groupValues.length,
-            active: groupValues.filter((g) => !g.listenOnly).length,
-            listenOnly: groupValues.filter((g) => g.listenOnly).length,
-          },
-        });
-      }
+    // GET /api/groups
+    if (req.method === 'GET' && pathname === '/api/groups') {
+      return json(res, getAllRegisteredGroups());
+    }
 
-      // GET /api/auth/qr
-      if (req.method === 'GET' && pathname === '/api/auth/qr') {
-        return json(res, {
-          status: waState.status,
-          qrDataUrl: waState.qrDataUrl,
-          qrExpiresAt: waState.qrExpiresAt,
-        });
-      }
+    // GET /api/tasks
+    if (req.method === 'GET' && pathname === '/api/tasks') {
+      return json(res, getAllTasks());
+    }
 
-      // GET /api/groups
-      if (req.method === 'GET' && pathname === '/api/groups') {
-        return json(res, getAllRegisteredGroups());
-      }
+    // GET /api/messages?jid=<jid>&since=<iso>&limit=<n>
+    if (req.method === 'GET' && pathname === '/api/messages') {
+      const jid = url.searchParams.get('jid');
+      if (!jid) return json(res, { error: 'jid parameter required' }, 400);
+      const since =
+        url.searchParams.get('since') ??
+        new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const limitParam = parseInt(url.searchParams.get('limit') ?? '50', 10);
+      const limit = isNaN(limitParam) ? 50 : Math.min(limitParam, 200);
+      return json(res, getMessagesSince(jid, since, ASSISTANT_NAME, limit));
+    }
 
-      // GET /api/tasks
-      if (req.method === 'GET' && pathname === '/api/tasks') {
-        return json(res, getAllTasks());
-      }
+    // GET /api/config
+    if (req.method === 'GET' && pathname === '/api/config') {
+      return json(res, {
+        publicHost: env.WEB_PUBLIC_HOST ?? null,
+        assistantName: ASSISTANT_NAME,
+      });
+    }
 
-      // GET /api/messages?jid=<jid>&since=<iso>&limit=<n>
-      if (req.method === 'GET' && pathname === '/api/messages') {
-        const jid = url.searchParams.get('jid');
-        if (!jid) return json(res, { error: 'jid parameter required' }, 400);
-        const since =
-          url.searchParams.get('since') ??
-          new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        const limitParam = parseInt(url.searchParams.get('limit') ?? '50', 10);
-        const limit = isNaN(limitParam) ? 50 : Math.min(limitParam, 200);
-        return json(res, getMessagesSince(jid, since, ASSISTANT_NAME, limit));
-      }
+    // GET /api/integrations — live credential status
+    if (req.method === 'GET' && pathname === '/api/integrations') {
+      return json(res, getIntegrationStatus());
+    }
 
-      // GET /api/config
-      if (req.method === 'GET' && pathname === '/api/config') {
-        return json(res, {
-          publicHost: env.WEB_PUBLIC_HOST ?? null,
-          assistantName: ASSISTANT_NAME,
-        });
-      }
-
-      // GET /api/integrations — live credential status
-      if (req.method === 'GET' && pathname === '/api/integrations') {
-        return json(res, getIntegrationStatus());
-      }
-
-      // POST /api/integrations/contacts/toggle
-      if (req.method === 'POST' && pathname === '/api/integrations/contacts/toggle') {
-        ensureNanoclawConfigDir();
-        const active = fs.existsSync(CONTACTS_TOGGLE_FILE);
-        if (active) {
-          try { fs.unlinkSync(CONTACTS_TOGGLE_FILE); } catch { /* ignore */ }
-        } else {
-          fs.writeFileSync(CONTACTS_TOGGLE_FILE, new Date().toISOString(), { mode: 0o600 });
-        }
-        return json(res, { active: !active });
-      }
-
-      // POST /api/integrations/:type/upload — save credential JSON
-      const uploadMatch = /^\/api\/integrations\/([a-z0-9-]+)\/upload$/.exec(pathname);
-      if (req.method === 'POST' && uploadMatch) {
-        const type = uploadMatch[1];
-        const credPath = CREDENTIAL_PATHS[type];
-        if (!credPath) return json(res, { error: 'Unknown integration type' }, 400);
-        let body: string;
+    // POST /api/integrations/contacts/toggle
+    if (
+      req.method === 'POST' &&
+      pathname === '/api/integrations/contacts/toggle'
+    ) {
+      ensureNanoclawConfigDir();
+      const active = fs.existsSync(CONTACTS_TOGGLE_FILE);
+      if (active) {
         try {
-          body = await readBody(req);
-          JSON.parse(body); // validate
+          fs.unlinkSync(CONTACTS_TOGGLE_FILE);
         } catch {
-          return json(res, { error: 'Invalid JSON' }, 400);
+          /* ignore */
         }
-        fs.mkdirSync(path.dirname(credPath), { recursive: true });
-        fs.writeFileSync(credPath, body, { mode: 0o600 });
-        logger.info({ type, credPath }, 'Integration credentials updated');
-        return json(res, { ok: true });
+      } else {
+        fs.writeFileSync(CONTACTS_TOGGLE_FILE, new Date().toISOString(), {
+          mode: 0o600,
+        });
       }
+      return json(res, { active: !active });
+    }
 
-      // Drain unknown /api/integrations/* requests
-      if (pathname.startsWith('/api/integrations')) {
-        req.resume();
-        return json(res, { error: 'Not found' }, 404);
+    // POST /api/integrations/:type/upload — save credential JSON
+    const uploadMatch = /^\/api\/integrations\/([a-z0-9-]+)\/upload$/.exec(
+      pathname,
+    );
+    if (req.method === 'POST' && uploadMatch) {
+      const type = uploadMatch[1];
+      const credPath = CREDENTIAL_PATHS[type];
+      if (!credPath)
+        return json(res, { error: 'Unknown integration type' }, 400);
+      let body: string;
+      try {
+        body = await readBody(req);
+        JSON.parse(body); // validate
+      } catch {
+        return json(res, { error: 'Invalid JSON' }, 400);
       }
+      fs.mkdirSync(path.dirname(credPath), { recursive: true });
+      fs.writeFileSync(credPath, body, { mode: 0o600 });
+      logger.info({ type, credPath }, 'Integration credentials updated');
+      return json(res, { ok: true });
+    }
 
+    // Drain unknown /api/integrations/* requests
+    if (pathname.startsWith('/api/integrations')) {
+      req.resume();
       return json(res, { error: 'Not found' }, 404);
     }
 
-    // Everything else — serve frontend static files
-    serveStatic(res, pathname);
+    return json(res, { error: 'Not found' }, 404);
+  }
+
+  // Everything else — serve frontend static files
+  serveStatic(res, pathname);
 }
 
 export function stopWebServer(): void {
