@@ -38,4 +38,9 @@ groups/global/*
 # Local Claude authoring/skill workspace (not for repository)
 .claude/
 
+# Internal/business docs (not for public repo)
+LearnClaw_v2.md
+.mcp.json
+repo-tokens/
+
 agents-sdk-docs
