@@ -35,12 +35,7 @@ groups/global/*
 # Skills system (local per-installation state)
 .nanoclaw/
 
-# Local Claude working artifacts (not for repository)
-.claude/session-log.md
-.claude/audit-trail.md
-.claude/milestones.md
-.claude/settings.json
-.claude/docs/changelog.md
-.claude/plans/
+# Local Claude authoring/skill workspace (not for repository)
+.claude/
 
 agents-sdk-docs
