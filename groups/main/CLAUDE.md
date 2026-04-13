@@ -85,17 +85,20 @@ Anthropic credentials must be either an API key from console.anthropic.com (`ANT
 
 ## Container Mounts
 
-Main has read-only access to the project and read-write access to its group folder:
+Main has read-only access to the project and read-write access to the store, global memory, and its group folder:
 
 | Container Path | Host Path | Access |
 |----------------|-----------|--------|
 | `/workspace/project` | Project root | read-only |
+| `/workspace/project/store` | `store/` | read-write |
+| `/workspace/global` | `groups/global/` | read-write |
 | `/workspace/group` | `groups/main/` | read-write |
 
 Key paths inside the container:
 - `/workspace/project/store/messages.db` - SQLite database
 - `/workspace/project/store/messages.db` (registered_groups table) - Group config
 - `/workspace/project/groups/` - All group folders
+- `/workspace/global/CLAUDE.md` - Shared global memory
 
 ---
 
@@ -269,7 +272,7 @@ Read `/workspace/project/data/registered_groups.json` and format it nicely.
 
 ## Global Memory
 
-You can read and write to `/workspace/project/groups/global/CLAUDE.md` for facts that should apply to all groups. Only update global memory when explicitly asked to "remember this globally" or similar.
+You can read and write to `/workspace/global/CLAUDE.md` for facts that should apply to all groups. Only update global memory when explicitly asked to "remember this globally" or similar.
 
 ---
 
