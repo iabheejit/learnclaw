@@ -1,3 +1,4 @@
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
@@ -5,15 +6,20 @@ import { readEnvFile } from './env.js';
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
+// Secrets (API keys, tokens) are NOT read here — they are loaded only
+// by the credential proxy (credential-proxy.ts), never exposed to containers.
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
-  'ONECLI_URL',
   'TZ',
 ]);
 
+export const DEFAULT_ASSISTANT_NAME = 'LearnClaw';
+
 export const ASSISTANT_NAME =
-  process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+  process.env.ASSISTANT_NAME ||
+  envConfig.ASSISTANT_NAME ||
+  DEFAULT_ASSISTANT_NAME;
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER ||
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
@@ -24,17 +30,24 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
+function resolveConfigDir(): string {
+  const preferredDir = path.join(HOME_DIR, '.config', 'learnclaw');
+  const legacyDir = path.join(HOME_DIR, '.config', 'nanoclaw');
+  if (fs.existsSync(preferredDir) || !fs.existsSync(legacyDir)) {
+    return preferredDir;
+  }
+  return legacyDir;
+}
+
+const CONFIG_DIR = resolveConfigDir();
+
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
+  CONFIG_DIR,
   'mount-allowlist.json',
 );
 export const SENDER_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
+  CONFIG_DIR,
   'sender-allowlist.json',
 );
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
@@ -51,8 +64,28 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,
 ); // 10MB default
-export const ONECLI_URL =
-  process.env.ONECLI_URL || envConfig.ONECLI_URL || 'http://localhost:10254';
+export const CREDENTIAL_PROXY_PORT = parseInt(
+  process.env.CREDENTIAL_PROXY_PORT || '3001',
+  10,
+);
+
+// AI provider selection:
+//   anthropic   — direct Anthropic API (default, uses Claude Agent SDK)
+//   openrouter  — OpenRouter gateway (Claude or other models via Anthropic-compat API)
+//   openai      — OpenAI-compatible endpoint (Ollama, Grok, Groq, Together, etc.)
+export type AgentProvider = 'anthropic' | 'openrouter' | 'openai';
+export const AGENT_PROVIDER: AgentProvider = (() => {
+  const v = (process.env.AGENT_PROVIDER || 'anthropic').toLowerCase();
+  if (v === 'openrouter' || v === 'openai') return v;
+  return 'anthropic';
+})();
+// Model to use. For openrouter/openai providers this is required.
+// e.g. "anthropic/claude-3.5-sonnet", "meta-llama/llama-3.1-70b", "ollama/llama3.1"
+export const AGENT_MODEL = process.env.AGENT_MODEL || '';
+export const TELEGRAM_BOT_POOL = (process.env.TELEGRAM_BOT_POOL || '')
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,

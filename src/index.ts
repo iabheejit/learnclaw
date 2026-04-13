@@ -1,19 +1,21 @@
 import fs from 'fs';
 import path from 'path';
 
-import { OneCLI } from '@onecli-sh/sdk';
-
 import {
   ASSISTANT_NAME,
+  CREDENTIAL_PROXY_PORT,
+  DEFAULT_ASSISTANT_NAME,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAX_MESSAGES_PER_PROMPT,
-  ONECLI_URL,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
   TIMEZONE,
 } from './config.js';
+import { startCredentialProxy } from './credential-proxy.js';
+import { initBotPool } from './channels/telegram.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -28,11 +30,13 @@ import {
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
+  PROXY_BIND_HOST,
 } from './container-runtime.js';
 import {
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
+  deleteSession,
   getAllTasks,
   getLastBotMessageTimestamp,
   getMessagesSince,
@@ -47,7 +51,10 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { syncHeartbeatTasksForChat } from './heartbeat.js';
 import { startIpcWatcher } from './ipc.js';
+import { recordQuizProgress } from './learning-progress.js';
+import { buildLearnerOnboardingPrompt } from './onboarding.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   restoreRemoteControl,
@@ -75,27 +82,6 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
-
-const onecli = new OneCLI({ url: ONECLI_URL });
-
-function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
-  if (group.isMain) return;
-  const identifier = group.folder.toLowerCase().replace(/_/g, '-');
-  onecli.ensureAgent({ name: group.name, identifier }).then(
-    (res) => {
-      logger.info(
-        { jid, identifier, created: res.created },
-        'OneCLI agent ensured',
-      );
-    },
-    (err) => {
-      logger.debug(
-        { jid, identifier, err: String(err) },
-        'OneCLI agent ensure skipped',
-      );
-    },
-  );
-}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -169,17 +155,20 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     );
     if (fs.existsSync(templateFile)) {
       let content = fs.readFileSync(templateFile, 'utf-8');
-      if (ASSISTANT_NAME !== 'Andy') {
-        content = content.replace(/^# Andy$/m, `# ${ASSISTANT_NAME}`);
-        content = content.replace(/You are Andy/g, `You are ${ASSISTANT_NAME}`);
+      if (ASSISTANT_NAME !== DEFAULT_ASSISTANT_NAME) {
+        content = content.replace(
+          /^# (Andy|LearnClaw)$/m,
+          `# ${ASSISTANT_NAME}`,
+        );
+        content = content.replace(
+          /You are (Andy|LearnClaw)/g,
+          `You are ${ASSISTANT_NAME}`,
+        );
       }
       fs.writeFileSync(groupMdFile, content);
       logger.info({ folder: group.folder }, 'Created CLAUDE.md from template');
     }
   }
-
-  // Ensure a corresponding OneCLI agent exists (best-effort, non-blocking)
-  ensureOneCLIAgent(jid, group);
 
   logger.info(
     { jid, name: group.name, folder: group.folder },
@@ -249,7 +238,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  let prompt = formatMessages(missedMessages, TIMEZONE);
+  if (!isMainGroup) {
+    prompt = buildLearnerOnboardingPrompt(prompt, group.folder, missedMessages);
+  }
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -331,6 +323,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  try {
+    syncHeartbeatTasksForChat(chatJid, group);
+  } catch (err) {
+    logger.warn(
+      { chatJid, folder: group.folder, err },
+      'Failed to synchronize heartbeat tasks after learner update',
+    );
+  }
+
   return true;
 }
 
@@ -402,6 +403,26 @@ async function runAgent(
     }
 
     if (output.status === 'error') {
+      // Detect stale/corrupt session — clear it so the next retry starts fresh.
+      // The session .jsonl can go missing after a crash mid-write, manual
+      // deletion, or disk-full. The existing backoff in group-queue.ts
+      // handles the retry; we just need to remove the broken session ID.
+      const isStaleSession =
+        sessionId &&
+        output.error &&
+        /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(
+          output.error,
+        );
+
+      if (isStaleSession) {
+        logger.warn(
+          { group: group.name, staleSessionId: sessionId, error: output.error },
+          'Stale session detected — clearing for next retry',
+        );
+        delete sessions[group.folder];
+        deleteSession(group.folder);
+      }
+
       logger.error(
         { group: group.name, error: output.error },
         'Container agent error',
@@ -423,7 +444,7 @@ async function startMessageLoop(): Promise<void> {
   }
   messageLoopRunning = true;
 
-  logger.info(`NanoClaw running (default trigger: ${DEFAULT_TRIGGER})`);
+  logger.info(`LearnClaw running (default trigger: ${DEFAULT_TRIGGER})`);
 
   while (true) {
     try {
@@ -552,17 +573,29 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
-  // Ensure OneCLI agents exist for all registered groups.
-  // Recovers from missed creates (e.g. OneCLI was down at registration time).
   for (const [jid, group] of Object.entries(registeredGroups)) {
-    ensureOneCLIAgent(jid, group);
+    try {
+      syncHeartbeatTasksForChat(jid, group);
+    } catch (err) {
+      logger.warn(
+        { jid, folder: group.folder, err },
+        'Failed to synchronize heartbeat tasks during startup',
+      );
+    }
   }
 
   restoreRemoteControl();
 
+  // Start credential proxy (containers route API calls through this)
+  const proxyServer = await startCredentialProxy(
+    CREDENTIAL_PROXY_PORT,
+    PROXY_BIND_HOST,
+  );
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    proxyServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -641,6 +674,32 @@ async function main(): Promise<void> {
         }
       }
       storeMessage(msg);
+
+      const group = registeredGroups[chatJid];
+      if (group && !group.isMain && !msg.is_from_me && !msg.is_bot_message) {
+        try {
+          const progressResult = recordQuizProgress(group.folder, msg.content, {
+            submittedAt: msg.timestamp,
+          });
+          if (progressResult.status === 'updated') {
+            logger.info(
+              {
+                chatJid,
+                groupFolder: group.folder,
+                score: progressResult.score,
+                total: progressResult.total,
+                weakTopic: progressResult.weakTopic,
+              },
+              'Recorded quiz progress from learner reply',
+            );
+          }
+        } catch (err) {
+          logger.warn(
+            { chatJid, folder: group.folder, err },
+            'Failed to record quiz progress from learner reply',
+          );
+        }
+      }
     },
     onChatMetadata: (
       chatJid: string,
@@ -671,6 +730,16 @@ async function main(): Promise<void> {
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
+  }
+
+  // Initialize Telegram bot pool for agent teams (if configured)
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
+  }
+
+  // Initialize Telegram bot pool for agent teams (if configured)
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
   }
 
   // Start subsystems (independently of connection handler)
