@@ -13,12 +13,21 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { ASSISTANT_NAME } from './config.js';
-import { getAllRegisteredGroups, getAllTasks, getMessagesSince } from './db.js';
+import {
+  completeHunterTask,
+  getAllRegisteredGroups,
+  getAllTasks,
+  getHunterTasks,
+  getLatestHunterStatus,
+  getMessagesSince,
+  upsertHunterStatus,
+} from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 import { waState } from './wa-state.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 const FRONTEND_DIR = path.resolve(__dirname, '..', 'frontend', 'dist');
 
 const MIME: Record<string, string> = {
@@ -341,6 +350,55 @@ async function handleRequest(
     if (pathname.startsWith('/api/integrations')) {
       req.resume();
       return json(res, { error: 'Not found' }, 404);
+    }
+
+    // ── Hunter Sync API ──────────────────────────────────────────────────────
+
+    // GET /api/hunter/tasks — Hunter polls this to get its task list
+    if (req.method === 'GET' && pathname === '/api/hunter/tasks') {
+      const statusFilter = url.searchParams.get('status') ?? 'open';
+      return json(res, getHunterTasks(statusFilter));
+    }
+
+    // PATCH /api/hunter/tasks/:id/complete — Hunter marks task done in brain DB
+    const taskCompleteMatch = /^\/api\/hunter\/tasks\/([^/]+)\/complete$/.exec(pathname);
+    if (req.method === 'PATCH' && taskCompleteMatch) {
+      const taskId = taskCompleteMatch[1];
+      const task = completeHunterTask(taskId);
+      if (!task) return json(res, { error: 'Task not found' }, 404);
+      logger.info({ taskId, title: task.title }, 'Hunter task completed');
+      return json(res, { ok: true, task });
+    }
+
+    // POST /api/hunter/status — Hunter pushes its current focus state
+    if (req.method === 'POST' && pathname === '/api/hunter/status') {
+      let body: string;
+      try {
+        body = await readBody(req);
+      } catch {
+        return json(res, { error: 'Failed to read body' }, 400);
+      }
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(body) as Record<string, unknown>;
+      } catch {
+        return json(res, { error: 'Invalid JSON' }, 400);
+      }
+      upsertHunterStatus({
+        recorded_at: new Date().toISOString(),
+        focus_percent: Number(payload.focus_percent ?? 0),
+        is_on_task: Boolean(payload.is_on_task),
+        is_monitoring: Boolean(payload.is_monitoring),
+        last_activity: (payload.last_activity as string) ?? null,
+        active_task_title: (payload.active_task_title as string) ?? null,
+        is_in_meeting: Boolean(payload.is_in_meeting),
+      });
+      return json(res, { ok: true });
+    }
+
+    // GET /api/hunter/status — latest focus state (for dashboard or agent context)
+    if (req.method === 'GET' && pathname === '/api/hunter/status') {
+      return json(res, getLatestHunterStatus() ?? { error: 'No status yet' });
     }
 
     return json(res, { error: 'Not found' }, 404);

@@ -578,15 +578,19 @@ function recoverPendingMessages(): void {
 
     const storedTimestamp = lastAgentTimestamp[chatJid] || '';
     // Use the more recent of stored timestamp or cutoff to avoid replaying old backlog
-    const sinceTimestamp =
-      storedTimestamp > cutoff ? storedTimestamp : cutoff;
+    const sinceTimestamp = storedTimestamp > cutoff ? storedTimestamp : cutoff;
 
     // Advance the stored timestamp so processGroup also skips stale messages
     if (sinceTimestamp > storedTimestamp) {
       lastAgentTimestamp[chatJid] = sinceTimestamp;
     }
 
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME, MAX_MESSAGES_PER_PROMPT);
+    const pending = getMessagesSince(
+      chatJid,
+      sinceTimestamp,
+      ASSISTANT_NAME,
+      MAX_MESSAGES_PER_PROMPT,
+    );
     if (pending.length > 0) {
       logger.info(
         { group: group.name, pendingCount: pending.length, cutoff },
@@ -753,7 +757,10 @@ async function main(): Promise<void> {
         if (guard === 'allow') {
           await channel.sendMessage(jid, text);
         } else {
-          logger.warn({ jid, reason: guard }, 'Scheduler outbound suppressed by guard');
+          logger.warn(
+            { jid, reason: guard },
+            'Scheduler outbound suppressed by guard',
+          );
         }
       }
     },
